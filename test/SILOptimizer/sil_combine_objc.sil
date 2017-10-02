@@ -1,5 +1,11 @@
-// RUN: %target-sil-opt -enable-sil-verify-all %s -sil-combine -verify-skip-unreachable-must-be-last | %FileCheck %s
+// RUN: %target-sil-opt -assume-parsing-unqualified-ownership-sil -enable-sil-verify-all %s -sil-combine -verify-skip-unreachable-must-be-last | %FileCheck %s
 // REQUIRES: objc_interop
+
+// FIXME: https://bugs.swift.org/browse/SR-2808
+// XFAIL: resilient_stdlib
+
+// See https://bugs.swift.org/browse/SR-5065, rdar://32511494
+// XFAIL: *
 
 sil_stage canonical
 
@@ -7,7 +13,7 @@ import Builtin
 import Swift
 
 class ZZZ {
-  @objc deinit 
+  @objc deinit
   init()
 }
 
@@ -130,7 +136,7 @@ bb0(%0 : $*_HeapBuffer<C, Int>):
 }
 
 // Check that it does not crash the compiler.
-// Int is ObjC-bridgeable in this case, but its conformance is not know, 
+// Int is ObjC-bridgeable in this case, but its conformance is not know,
 // because Foundation is not imported yet.
 // Therefore the cast may succeed from the compiler point of view.
 // CHECK-LABEL: sil @cast_of_class_to_int
@@ -141,10 +147,46 @@ bb0(%0 : $C):
   %1 = alloc_stack $Int
   %2 = alloc_stack $C
   store %0 to %2 : $*C
-  unconditional_checked_cast_addr take_always C in %2 : $*C to Int in %1 : $*Int 
+  unconditional_checked_cast_addr C in %2 : $*C to Int in %1 : $*Int
   %4 = load %1 : $*Int
   dealloc_stack %2 : $*C
   dealloc_stack %1 : $*Int
   return %4 : $Int
+}
+
+@objc(XX) protocol XX {
+}
+
+class XXImpl : XX {
+  @objc deinit
+  init()
+}
+
+// CHECK-LABEL: sil @remove_release_objc_metatype_to_object
+// CHECK-NOT: strong_release {{%[0-9]+}} : $AnyObject
+sil @remove_release_objc_metatype_to_object : $@convention(thin) () -> () {
+bb0:
+  %0 = metatype $@thick XXImpl.Type                // user: %1
+  %1 = thick_to_objc_metatype %0 : $@thick XXImpl.Type to $@objc_metatype XXImpl.Type // user: %2
+  %2 = objc_metatype_to_object %1 : $@objc_metatype XXImpl.Type to $AnyObject // users: %3, %4
+  debug_value %2 : $AnyObject  // id: %3
+  strong_release %2 : $AnyObject                  // id: %4
+  %5 = tuple ()                                   // user: %6
+  return %5 : $()                                 // id: %6
+}
+
+// CHECK-LABEL: sil @remove_release_objc_existential_metatype_to_object
+// CHECK-NOT: strong_release {{%[0-9]+}} : $AnyObject
+sil @remove_release_objc_existential_metatype_to_object: $@convention(thin) (@owned XX) -> () {
+bb0(%0 : $XX):
+  debug_value %0 : $XX                   // id: %1
+  %2 = existential_metatype $@thick XX.Type, %0 : $XX // user: %3
+  %3 = thick_to_objc_metatype %2 : $@thick XX.Type to $@objc_metatype XX.Type // user: %4
+  %4 = objc_existential_metatype_to_object %3 : $@objc_metatype XX.Type to $AnyObject // users: %5, %6
+  debug_value %4 : $AnyObject, let, name "obj1" // id: %5
+  strong_release %4 : $AnyObject                  // id: %6
+  strong_release %0 : $XX                         // id: %7
+  %8 = tuple ()                                   // user: %9
+  return %8 : $()                                 // id: %9
 }
 

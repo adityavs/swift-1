@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -76,20 +76,16 @@ public:
     return (isFixedSize(expansion) && StorageSize.isZero());
   }
 
-  ContainedAddress allocateStack(IRGenFunction &IGF, SILType T,
-                                 const llvm::Twine &name) const override;
-  void deallocateStack(IRGenFunction &IGF, Address addr, SILType T) const override;
-  void destroyStack(IRGenFunction &IGF, Address addr, SILType T) const override;
+  StackAddress allocateStack(IRGenFunction &IGF, SILType T, bool isEntryBlock,
+                             const llvm::Twine &name) const override;
+  void deallocateStack(IRGenFunction &IGF, StackAddress addr, SILType T) const override;
+  void destroyStack(IRGenFunction &IGF, StackAddress addr, SILType T) const override;
 
   // We can give these reasonable default implementations.
 
   void initializeWithTake(IRGenFunction &IGF, Address destAddr,
                           Address srcAddr, SILType T) const override;
 
-  std::pair<llvm::Value*, llvm::Value*>
-  getSizeAndAlignmentMask(IRGenFunction &IGF, SILType T) const override;
-  std::tuple<llvm::Value*,llvm::Value*,llvm::Value*>
-  getSizeAndAlignmentMaskAndStride(IRGenFunction &IGF, SILType T) const override;
   llvm::Value *getSize(IRGenFunction &IGF, SILType T) const override;
   llvm::Value *getAlignmentMask(IRGenFunction &IGF, SILType T) const override;
   llvm::Value *getStride(IRGenFunction &IGF, SILType T) const override;

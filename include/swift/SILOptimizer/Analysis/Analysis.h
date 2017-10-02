@@ -2,24 +2,25 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
-#include "llvm/Support/Casting.h"
+#ifndef SWIFT_SILOPTIMIZER_ANALYSIS_ANALYSIS_H
+#define SWIFT_SILOPTIMIZER_ANALYSIS_ANALYSIS_H
+
+#include "swift/Basic/NullablePtr.h"
+#include "swift/SIL/Notifications.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/Optional.h"
 #include "llvm/ADT/SmallVector.h"
-#include "swift/SIL/Notifications.h"
+#include "llvm/Support/Casting.h"
 #include <vector>
-
-#ifndef SWIFT_SILOPTIMIZER_ANALYSIS_ANALYSIS_H
-#define SWIFT_SILOPTIMIZER_ANALYSIS_ANALYSIS_H
 
 namespace swift {
   class SILModule;
@@ -55,13 +56,6 @@ namespace swift {
       /// has been modified.
       Branches = 0x4,
 
-      /// The pass delete or created new functions.
-      ///
-      /// The intent behind this is so that analyses that cache
-      /// SILFunction* to be able to be invalidated and later
-      /// recomputed so that they are not holding dangling pointers.
-      Functions = 0x8,
-
       /// Convenience states:
       FunctionBody = Calls | Branches | Instructions,
 
@@ -69,7 +63,7 @@ namespace swift {
 
       BranchesAndInstructions = Branches | Instructions,
 
-      Everything = Functions | Calls | Branches | Instructions,
+      Everything = Calls | Branches | Instructions,
     };
 
     /// A list of the known analysis.
@@ -112,22 +106,20 @@ namespace swift {
     bool isLocked() { return invalidationLock; }
 
     /// Invalidate all information in this analysis.
-    virtual void invalidate(InvalidationKind K) {}
+    virtual void invalidate() = 0;
 
     /// Invalidate all of the information for a specific function.
-    virtual void invalidate(SILFunction *F, InvalidationKind K) {}
+    virtual void invalidate(SILFunction *F, InvalidationKind K) = 0;
 
-    /// Invalidate all of the information for a specific function. Also, we
-    /// know that this function is a dead function and going to be deleted from
-    /// the module.
-    virtual void invalidateForDeadFunction(SILFunction *F, InvalidationKind K) {
-      // Call the normal invalidate function unless overridden by specific
-      // analysis.
-      invalidate(F, K);
-    }
-    
     /// Notify the analysis about a newly created function.
-    virtual void notifyAnalysisOfFunction(SILFunction *F) {}
+    virtual void notifyAddFunction(SILFunction *F) = 0;
+
+    /// Notify the analysis about a function which will be deleted from the
+    /// module.
+    virtual void notifyDeleteFunction(SILFunction *F) = 0;
+
+    /// Notify the analysis about changed witness or vtables.
+    virtual void invalidateFunctionTables() = 0;
 
     /// Verify the state of this analysis.
     virtual void verify() const {}
@@ -142,6 +134,18 @@ namespace swift {
 
     /// Verify that the function \p F can be used by the analysis.
     static void verifyFunction(SILFunction *F);
+  };
+
+  // RAII helper for locking analyses.
+  class AnalysisPreserver {
+    SILAnalysis *Analysis;
+    public:
+    AnalysisPreserver(SILAnalysis *A) : Analysis(A) {
+      Analysis->lockInvalidation();
+    }
+    ~AnalysisPreserver() {
+      Analysis->unlockInvalidation();
+    }
   };
 
   /// An abstract base class that implements the boiler plate of caching and
@@ -165,7 +169,24 @@ namespace swift {
     /// meant to be overridden by subclasses.
     virtual void verify(AnalysisTy *A) const {}
 
+    void deleteAllAnalysisProviders() {
+      for (auto D : Storage)
+        delete D.second;
+      Storage.clear();
+    }
+
   public:
+    /// Returns true if we have an analysis for a specific function \p F without
+    /// actually constructing it.
+    bool hasAnalysis(SILFunction *F) const { return Storage.count(F); }
+
+    NullablePtr<AnalysisTy> maybeGet(SILFunction *F) {
+      auto Iter = Storage.find(F);
+      if (Iter == Storage.end())
+        return nullptr;
+      return Iter->second;
+    }
+
     /// Returns an analysis provider for a specific function \p F.
     AnalysisTy *get(SILFunction *F) {
 
@@ -178,19 +199,13 @@ namespace swift {
       return it.second;
     }
 
-    virtual void invalidate(SILAnalysis::InvalidationKind K) override {
-      if (!shouldInvalidate(K)) return;
-
-      for (auto D : Storage)
-        delete D.second;
-
-      Storage.clear();
+    /// Invalidate all information in this analysis.
+    virtual void invalidate() override {
+      deleteAllAnalysisProviders();
     }
 
-    virtual void invalidate(SILFunction *F,
-                            SILAnalysis::InvalidationKind K) override {
-      if (!shouldInvalidate(K)) return;
-
+    /// Helper function to remove the analysis data for a function.
+    void invalidateFunction(SILFunction *F) {
       auto &it = Storage.FindAndConstruct(F);
       if (it.second) {
         delete it.second;
@@ -198,10 +213,28 @@ namespace swift {
       }
     }
 
+    /// Invalidate all of the information for a specific function.
+    virtual void invalidate(SILFunction *F,
+                            SILAnalysis::InvalidationKind K) override {
+      if (shouldInvalidate(K))
+        invalidateFunction(F);
+    }
+
+    /// Notify the analysis about a newly created function.
+    virtual void notifyAddFunction(SILFunction *F) override { }
+
+    /// Notify the analysis about a function which will be deleted from the
+    /// module.
+    virtual void notifyDeleteFunction(SILFunction *F) override {
+      invalidateFunction(F);
+    }
+
+    /// Notify the analysis about changed witness or vtables.
+    virtual void invalidateFunctionTables() override { }
+
     FunctionAnalysisBase() {}
     virtual ~FunctionAnalysisBase() {
-      for (auto D : Storage)
-        delete D.second;
+      deleteAllAnalysisProviders();
     }
     FunctionAnalysisBase(AnalysisKind K) : SILAnalysis(K), Storage() {}
     FunctionAnalysisBase(const FunctionAnalysisBase &) = delete;
@@ -232,6 +265,29 @@ namespace swift {
         return;
       verify(Iter->second);
     }
+  };
+
+  /// Given a specific type of analysis and its function info. Store the
+  /// analysis and upon request instantiate the function info, caching the
+  /// function info for subsequent requests.
+  template <class AnalysisTy, class FunctionInfoTy>
+  class LazyFunctionInfo {
+    SILFunction *F;
+    AnalysisTy *A;
+    NullablePtr<FunctionInfoTy> FTy;
+
+  public:
+    LazyFunctionInfo(SILFunction *F, AnalysisTy *A) : F(F), A(A), FTy() {}
+
+    operator FunctionInfoTy *() {
+      if (FTy.isNull()) {
+        FTy = A->get(F);
+      }
+
+      return FTy.get();
+    }
+
+    FunctionInfoTy *operator->() { return *this; }
   };
 
 #define ANALYSIS(NAME)                                                         \

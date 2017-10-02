@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -26,10 +26,10 @@ using namespace swift;
 
 /// Create a new empty function with the correct arguments and a unique name.
 SILFunction *GenericCloner::initCloned(SILFunction *Orig,
-                                       IsFragile_t Fragile,
+                                       IsSerialized_t Serialized,
                                        const ReabstractionInfo &ReInfo,
                                        StringRef NewName) {
-  assert((!Fragile || Orig->isFragile())
+  assert((!Serialized || Orig->isSerialized())
          && "Specialization cannot make body more resilient");
   assert((Orig->isTransparent() || Orig->isBare() || Orig->getLocation())
          && "SILFunction missing location");
@@ -40,71 +40,94 @@ SILFunction *GenericCloner::initCloned(SILFunction *Orig,
   // Create a new empty function.
   SILFunction *NewF = Orig->getModule().createFunction(
       getSpecializedLinkage(Orig, Orig->getLinkage()), NewName,
-      ReInfo.getSpecializedType(), nullptr,
-      Orig->getLocation(), Orig->isBare(), Orig->isTransparent(),
-      Fragile, Orig->isThunk(), Orig->getClassVisibility(),
+      ReInfo.getSpecializedType(), ReInfo.getSpecializedGenericEnvironment(),
+      Orig->getLocation(), Orig->isBare(), Orig->isTransparent(), Serialized,
+      Orig->getEntryCount(), Orig->isThunk(), Orig->getClassSubclassScope(),
       Orig->getInlineStrategy(), Orig->getEffectsKind(), Orig,
-      Orig->getDebugScope(), Orig->getDeclContext());
-  NewF->setDeclCtx(Orig->getDeclContext());
+      Orig->getDebugScope());
   for (auto &Attr : Orig->getSemanticsAttrs()) {
     NewF->addSemanticsAttr(Attr);
+  }
+  if (Orig->hasUnqualifiedOwnership()) {
+    NewF->setUnqualifiedOwnership();
   }
   return NewF;
 }
 
 void GenericCloner::populateCloned() {
   SILFunction *Cloned = getCloned();
-  SILModule &M = Cloned->getModule();
 
   // Create arguments for the entry block.
   SILBasicBlock *OrigEntryBB = &*Original.begin();
-  SILBasicBlock *ClonedEntryBB = new (M) SILBasicBlock(Cloned);
+  SILBasicBlock *ClonedEntryBB = Cloned->createBasicBlock();
   getBuilder().setInsertionPoint(ClonedEntryBB);
 
   llvm::SmallVector<AllocStackInst *, 8> AllocStacks;
   AllocStackInst *ReturnValueAddr = nullptr;
 
   // Create the entry basic block with the function arguments.
-  auto I = OrigEntryBB->bbarg_begin(), E = OrigEntryBB->bbarg_end();
-  int ArgIdx = 0;
-  while (I != E) {
-    SILArgument *OrigArg = *I;
+  auto origConv = Original.getConventions();
+  unsigned ArgIdx = 0;
+  for (auto &OrigArg : OrigEntryBB->getArguments()) {
     RegularLocation Loc((Decl *)OrigArg->getDecl());
     AllocStackInst *ASI = nullptr;
     SILType mappedType = remapType(OrigArg->getType());
-    if (ReInfo.isArgConverted(ArgIdx)) {
+
+    auto createAllocStack = [&]() {
       // We need an alloc_stack as a replacement for the indirect parameter.
       assert(mappedType.isAddress());
       mappedType = mappedType.getObjectType();
       ASI = getBuilder().createAllocStack(Loc, mappedType);
       ValueMap[OrigArg] = ASI;
       AllocStacks.push_back(ASI);
-      if (ReInfo.isResultIndex(ArgIdx)) {
-        // This result is converted from indirect to direct. The return inst
-        // needs to load the value from the alloc_stack. See below.
-        assert(!ReturnValueAddr);
-        ReturnValueAddr = ASI;
-      } else {
-        // Store the new direct parameter to the alloc_stack.
-        auto *NewArg =
-          new (M) SILArgument(ClonedEntryBB, mappedType, OrigArg->getDecl());
-        getBuilder().createStore(Loc, NewArg, ASI);
+    };
+    auto handleConversion = [&]() {
+      if (!origConv.useLoweredAddresses())
+        return false;
 
-        // Try to create a new debug_value from an existing debug_value_addr.
-        for (Operand *ArgUse : OrigArg->getUses()) {
-          if (auto *DVAI = dyn_cast<DebugValueAddrInst>(ArgUse->getUser())) {
-            getBuilder().createDebugValue(DVAI->getLoc(), NewArg,
-                                          DVAI->getVarInfo());
-            break;
+      if (ArgIdx < origConv.getSILArgIndexOfFirstParam()) {
+        // Handle result arguments.
+        unsigned formalIdx =
+            origConv.getIndirectFormalResultIndexForSILArg(ArgIdx);
+        if (ReInfo.isFormalResultConverted(formalIdx)) {
+          // This result is converted from indirect to direct. The return inst
+          // needs to load the value from the alloc_stack. See below.
+          createAllocStack();
+          assert(!ReturnValueAddr);
+          ReturnValueAddr = ASI;
+          return true;
+        }
+      } else {
+        // Handle arguments for formal parameters.
+        unsigned paramIdx = ArgIdx - origConv.getSILArgIndexOfFirstParam();
+        if (ReInfo.isParamConverted(paramIdx)) {
+          // Store the new direct parameter to the alloc_stack.
+          createAllocStack();
+          auto *NewArg = ClonedEntryBB->createFunctionArgument(
+              mappedType, OrigArg->getDecl());
+          getBuilder().createStore(Loc, NewArg, ASI,
+                                   StoreOwnershipQualifier::Unqualified);
+
+          // Try to create a new debug_value from an existing debug_value_addr.
+          for (Operand *ArgUse : OrigArg->getUses()) {
+            if (auto *DVAI = dyn_cast<DebugValueAddrInst>(ArgUse->getUser())) {
+              getBuilder().setCurrentDebugScope(remapScope(DVAI->getDebugScope()));
+              getBuilder().createDebugValue(DVAI->getLoc(), NewArg,
+                                            DVAI->getVarInfo());
+              getBuilder().setCurrentDebugScope(nullptr);
+              break;
+            }
           }
+          return true;
         }
       }
-    } else {
+      return false; // No conversion.
+    };
+    if (!handleConversion()) {
       auto *NewArg =
-        new (M) SILArgument(ClonedEntryBB, mappedType, OrigArg->getDecl());
+          ClonedEntryBB->createFunctionArgument(mappedType, OrigArg->getDecl());
       ValueMap[OrigArg] = NewArg;
     }
-    ++I;
     ++ArgIdx;
   }
 
@@ -122,8 +145,9 @@ void GenericCloner::populateCloned() {
       if (ReturnValueAddr) {
         // The result is converted from indirect to direct. We have to load the
         // returned value from the alloc_stack.
-        ReturnValue = getBuilder().createLoad(ReturnValueAddr->getLoc(),
-                                              ReturnValueAddr);
+        ReturnValue =
+            getBuilder().createLoad(ReturnValueAddr->getLoc(), ReturnValueAddr,
+                                    LoadOwnershipQualifier::Unqualified);
       }
       for (AllocStackInst *ASI : reverse(AllocStacks)) {
         getBuilder().createDeallocStack(ASI->getLoc(), ASI);

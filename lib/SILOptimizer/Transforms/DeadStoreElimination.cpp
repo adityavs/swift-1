@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 ///
@@ -110,9 +110,23 @@ static llvm::SmallVector<SILInstruction *, 1>
 findDeallocStackInst(AllocStackInst *ASI) {
   llvm::SmallVector<SILInstruction *, 1> DSIs;
   for (auto UI = ASI->use_begin(), E = ASI->use_end(); UI != E; ++UI) {
-    if (DeallocStackInst *D = dyn_cast<DeallocStackInst>(UI->getUser())) {
+    if (auto *D = dyn_cast<DeallocStackInst>(UI->getUser())) {
       DSIs.push_back(D);
     }   
+  }
+  return DSIs;
+}
+
+/// Return the deallocate ref instructions corresponding to the given
+/// AllocRefInst.
+static llvm::SmallVector<SILInstruction *, 1>
+findDeallocRefInst(AllocRefInst *ARI) {
+  llvm::SmallVector<SILInstruction *, 1> DSIs;
+  for (auto UI = ARI->use_begin(), E = ARI->use_end(); UI != E; ++UI) {
+    if (auto *D = dyn_cast<DeallocRefInst>(UI->getUser())) {
+      if (D->isDeallocatingStack())
+        DSIs.push_back(D);
+    }
   }
   return DSIs;
 }
@@ -133,15 +147,14 @@ static inline bool isPerformingDSE(DSEKind Kind) {
 /// general sense but are inert from a load store perspective.
 static bool isDeadStoreInertInstruction(SILInstruction *Inst) {
   switch (Inst->getKind()) {
-  case ValueKind::StrongRetainInst:
-  case ValueKind::StrongRetainUnownedInst:
-  case ValueKind::UnownedRetainInst:
-  case ValueKind::RetainValueInst:
-  case ValueKind::DeallocStackInst:
-  case ValueKind::CondFailInst:
-  case ValueKind::IsUniqueInst:
-  case ValueKind::IsUniqueOrPinnedInst:
-  case ValueKind::FixLifetimeInst:
+  case SILInstructionKind::StrongRetainInst:
+  case SILInstructionKind::StrongRetainUnownedInst:
+  case SILInstructionKind::UnownedRetainInst:
+  case SILInstructionKind::RetainValueInst:
+  case SILInstructionKind::DeallocStackInst:
+  case SILInstructionKind::DeallocRefInst:
+  case SILInstructionKind::CondFailInst:
+  case SILInstructionKind::FixLifetimeInst:
     return true;
   default:
     return false;
@@ -590,7 +603,7 @@ void DSEContext::processBasicBlockForGenKillSet(SILBasicBlock *BB) {
   }
 
   // Handle SILArgument for base invalidation.
-  ArrayRef<SILArgument *> Args = BB->getBBArgs();
+  ArrayRef<SILArgument *> Args = BB->getArguments();
   for (auto &X : Args) {
     invalidateBase(X, BBState, DSEKind::BuildGenKillSet);
   }
@@ -633,7 +646,7 @@ void DSEContext::processBasicBlockForDSE(SILBasicBlock *BB, bool Optimistic) {
   }
 
   // Handle SILArgument for base invalidation.
-  ArrayRef<SILArgument *> Args = BB->getBBArgs();
+  ArrayRef<SILArgument *> Args = BB->getArguments();
   for (auto &X : Args) {
     invalidateBase(X, S, DSEKind::BuildGenKillSet);
   }
@@ -649,6 +662,16 @@ void BlockState::initStoreSetAtEndOfBlock(DSEContext &Ctx) {
     // Turn on the store bit at the block which the stack slot is deallocated.
     if (auto *ASI = dyn_cast<AllocStackInst>(LocationVault[i].getBase())) {
       for (auto X : findDeallocStackInst(ASI)) {
+        SILBasicBlock *DSIBB = X->getParent();
+        if (DSIBB != BB)
+          continue;
+        startTrackingLocation(BBDeallocateLocation, i);
+      }
+    }
+    if (auto *ARI = dyn_cast<AllocRefInst>(LocationVault[i].getBase())) {
+      if (!ARI->isAllocatingStack())
+        continue;
+      for (auto X : findDeallocRefInst(ARI)) {
         SILBasicBlock *DSIBB = X->getParent();
         if (DSIBB != BB)
           continue;
@@ -1086,7 +1109,8 @@ void DSEContext::processInstruction(SILInstruction *I, DSEKind Kind) {
   }  
 
   // Check whether this instruction will invalidate any other locations.
-  invalidateBase(I, getBlockState(I), Kind);
+  for (auto result : I->getResults())
+    invalidateBase(result, getBlockState(I), Kind);
 }
 
 void DSEContext::runIterativeDSE() {
@@ -1115,7 +1139,7 @@ void DSEContext::runIterativeDSE() {
     SILBasicBlock *BB = WorkList.pop_back_val();
     HandledBBs.erase(BB);
     if (processBasicBlockWithGenKillSet(BB)) {
-      for (auto X : BB->getPreds()) {
+      for (auto X : BB->getPredecessorBlocks()) {
         // We do not push basic block into the worklist if its already 
         // in the worklist.
         if (HandledBBs.find(X) != HandledBBs.end())
@@ -1191,10 +1215,11 @@ bool DSEContext::run() {
     for (auto &X : S->LiveAddr) {
       Changed = true;
       auto I = S->LiveStores.find(X);
-      SILInstruction *Inst = cast<SILInstruction>(I->first);
+      SILInstruction *Inst = I->first->getDefiningInstruction();
       auto *IT = &*std::next(Inst->getIterator());
       SILBuilderWithScope Builder(IT);
-      Builder.createStore(Inst->getLoc(), I->second, Inst);
+      Builder.createStore(Inst->getLoc(), I->second, I->first,
+                          StoreOwnershipQualifier::Unqualified);
     }
     // Delete the dead stores.
     for (auto &I : getBlockState(&BB)->DeadStores) {
@@ -1216,8 +1241,6 @@ namespace {
 
 class DeadStoreElimination : public SILFunctionTransform {
 public:
-  StringRef getName() override { return "SIL Dead Store Elimination"; }
-
   /// The entry point to the transformation.
   void run() override {
     SILFunction *F = getFunction();

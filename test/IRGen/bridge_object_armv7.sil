@@ -1,4 +1,4 @@
-// RUN: %swift -module-name bridge_object -emit-ir -target armv7-apple-ios8.0 %s | %FileCheck %s
+// RUN: %swift -assume-parsing-unqualified-ownership-sil -module-name bridge_object -emit-ir -target armv7-apple-ios8.0 %s | %FileCheck %s
 
 // REQUIRES: CODEGENERATOR=ARM
 
@@ -24,7 +24,7 @@ entry(%c : $C, %w : $Builtin.Word):
   return %b : $Builtin.BridgeObject
 }
 
-// CHECK-LABEL: define{{( protected)?}} { %objc_object*, i32 } @convert_from_bridge_object
+// CHECK-LABEL: define{{( protected)?}} swiftcc { %objc_object*, i32 } @convert_from_bridge_object
 // CHECK:         [[BOBITS:%.*]] = ptrtoint [[BRIDGE:%swift.bridge\*]] %0 to i32
 // CHECK:         [[MASKED_BITS:%.*]] = and i32 [[BOBITS]], -4
 // CHECK:         inttoptr i32 [[MASKED_BITS]] to [[C:%objc_object\*]]

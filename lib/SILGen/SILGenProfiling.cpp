@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -15,7 +15,6 @@
 #include "SILGenFunction.h"
 #include "swift/AST/ASTNode.h"
 #include "swift/AST/ASTWalker.h"
-#include "swift/Basic/Fallthrough.h"
 #include "swift/Parse/Lexer.h"
 #include "swift/SIL/FormalLinkage.h"
 #include "llvm/IR/Intrinsics.h"
@@ -56,8 +55,8 @@ static void walkFunctionForProfiling(AbstractFunctionDecl *Root,
 
   // We treat class initializers as part of the constructor for profiling.
   if (auto *CD = dyn_cast<ConstructorDecl>(Root)) {
-    Type DT = CD->getDeclContext()->getDeclaredTypeInContext();
-    auto *NominalType = DT->getNominalOrBoundGenericNominal();
+    auto *NominalType = CD->getDeclContext()
+        ->getAsNominalTypeOrNominalTypeExtensionContext();
     for (auto *Member : NominalType->getMembers()) {
       // Find pattern binding declarations that have initializers.
       if (auto *PBD = dyn_cast<PatternBindingDecl>(Member))
@@ -83,7 +82,7 @@ ProfilerRAII::ProfilerRAII(SILGenModule &SGM, Decl *D)
   assert(isa<AbstractFunctionDecl>(D) ||
          isa<TopLevelCodeDecl>(D) && "Cannot create profiler for this decl");
   const auto &Opts = SGM.M.getOptions();
-  if (!Opts.GenerateProfile || isUnmappedDecl(D))
+  if ((!Opts.GenerateProfile && Opts.UseProfile.empty()) || isUnmappedDecl(D))
     return;
   SGM.Profiler =
       llvm::make_unique<SILGenProfiling>(SGM, Opts.EmitProfileCoverageMapping);
@@ -124,8 +123,6 @@ struct MapRegionCounters : public ASTWalker {
       CounterMap[WS->getBody()] = NextCounter++;
     } else if (auto *RWS = dyn_cast<RepeatWhileStmt>(S)) {
       CounterMap[RWS->getBody()] = NextCounter++;
-    } else if (auto *FS = dyn_cast<ForStmt>(S)) {
-      CounterMap[FS->getBody()] = NextCounter++;
     } else if (auto *FES = dyn_cast<ForEachStmt>(S)) {
       CounterMap[FES->getBody()] = NextCounter++;
       walkPatternForProfiling(FES->getIterator(), *this);
@@ -142,10 +139,11 @@ struct MapRegionCounters : public ASTWalker {
   }
 
   std::pair<bool, Expr *> walkToExprPre(Expr *E) override {
-    if (auto *IE = dyn_cast<IfExpr>(E))
+    if (auto *IE = dyn_cast<IfExpr>(E)) {
       CounterMap[IE->getThenExpr()] = NextCounter++;
-    else if (isa<AutoClosureExpr>(E) || isa<ClosureExpr>(E))
+    } else if (isa<AutoClosureExpr>(E) || isa<ClosureExpr>(E)) {
       CounterMap[E] = NextCounter++;
+    }
     return {true, E};
   }
 };
@@ -226,6 +224,8 @@ public:
     case Kind::Ref:
       return LHS->expand(Builder, Counters);
     }
+
+    llvm_unreachable("Unhandled Kind in switch.");
   }
 };
 
@@ -269,6 +269,195 @@ public:
   const SourceLoc &getEndLoc() const {
     assert(EndLoc && "Region has no end location");
     return *EndLoc;
+  }
+};
+
+/// An ASTWalker that maps ASTNodes to profiling counters.
+struct PGOMapping : public ASTWalker {
+  /// The next counter value to assign.
+  unsigned NextCounter;
+
+  /// The map of statements to counters.
+  llvm::DenseMap<ASTNode, ProfileCounter> &LoadedCounterMap;
+  llvm::Expected<llvm::InstrProfRecord> &LoadedCounts;
+  llvm::DenseMap<ASTNode, ASTNode> &CondToParentMap;
+  llvm::DenseMap<ASTNode, unsigned> CounterMap;
+
+  PGOMapping(llvm::DenseMap<ASTNode, ProfileCounter> &LoadedCounterMap,
+             llvm::Expected<llvm::InstrProfRecord> &LoadedCounts,
+             llvm::DenseMap<ASTNode, ASTNode> &PGORegionCondToParentMap)
+      : NextCounter(0), LoadedCounterMap(LoadedCounterMap),
+        LoadedCounts(LoadedCounts), CondToParentMap(PGORegionCondToParentMap) {}
+
+  unsigned getParentCounter() const {
+    if (Parent.isNull())
+      return 0;
+    else if (Parent.getKind() == ASTWalker::ParentKind::Decl) {
+      auto it = CounterMap.find(Parent.getAsDecl());
+      return (it != CounterMap.end()) ? it->getSecond() : 0;
+    } else if (Parent.getKind() == ASTWalker::ParentKind::Stmt) {
+      auto it = CounterMap.find(Parent.getAsStmt());
+      return (it != CounterMap.end()) ? it->getSecond() : 0;
+    } else if (Parent.getKind() == ASTWalker::ParentKind::Expr) {
+      auto it = CounterMap.find(Parent.getAsExpr());
+      return (it != CounterMap.end()) ? it->getSecond() : 0;
+    }
+    return 0;
+  }
+
+  ProfileCounter subtract(ProfileCounter L, ProfileCounter R) {
+    if (!L.hasValue() || !R.hasValue()) {
+      return L;
+    }
+    uint64_t LV = L.getValue();
+    uint64_t RV = R.getValue();
+    assert(LV >= RV && "Invalid counter subtraction");
+    return LV - RV;
+  }
+
+  /// Load the execution count corresponding to \p Node from a profile, if one
+  /// is available.
+  ProfileCounter loadExecutionCount(ASTNode Node) {
+    if (!Node)
+      return ProfileCounter();
+
+    auto CounterIt = CounterMap.find(Node);
+    assert(CounterIt != CounterMap.end() &&
+           "region does not have an associated counter");
+
+    unsigned CounterIndexForFunc = CounterIt->second;
+    return LoadedCounts->Counts[CounterIndexForFunc];
+  }
+
+  bool walkToDeclPre(Decl *D) override {
+    if (isUnmappedDecl(D))
+      return false;
+    if (auto *AFD = dyn_cast<AbstractFunctionDecl>(D)) {
+      auto node = AFD->getBody();
+      CounterMap[node] = NextCounter++;
+      auto count = loadExecutionCount(node);
+      LoadedCounterMap[node] = count;
+    }
+    if (auto *TLCD = dyn_cast<TopLevelCodeDecl>(D)) {
+      auto node = TLCD->getBody();
+      CounterMap[node] = NextCounter++;
+      auto count = loadExecutionCount(node);
+      LoadedCounterMap[node] = count;
+    }
+    return true;
+  }
+
+  std::pair<bool, Stmt *> walkToStmtPre(Stmt *S) override {
+    unsigned parent = getParentCounter();
+    if (auto *IS = dyn_cast<IfStmt>(S)) {
+      auto thenStmt = IS->getThenStmt();
+      CounterMap[thenStmt] = NextCounter++;
+      auto thenCount = loadExecutionCount(thenStmt);
+      LoadedCounterMap[thenStmt] = thenCount;
+      if (auto elseStmt = IS->getElseStmt()) {
+        CounterMap[elseStmt] = parent;
+        auto count = loadExecutionCount(elseStmt);
+        if (!parent) {
+          auto thenVal = thenCount.getValue();
+          for (auto pCount = NextCounter - 1; pCount > 0; --pCount) {
+            auto cCount = LoadedCounts->Counts[pCount];
+            if (cCount > thenVal) {
+              count = cCount;
+              break;
+            }
+          }
+        }
+        LoadedCounterMap[elseStmt] = subtract(count, thenCount);
+        auto Cond = IS->getCond();
+        for (const auto &elt : Cond) {
+          if (elt.getKind() ==
+              StmtConditionElement::ConditionKind::CK_PatternBinding) {
+            CondToParentMap[elt.getInitializer()] = IS;
+          }
+        }
+      }
+    } else if (auto *US = dyn_cast<GuardStmt>(S)) {
+      auto guardBody = US->getBody();
+      CounterMap[guardBody] = NextCounter++;
+      auto guardCount = loadExecutionCount(guardBody);
+      LoadedCounterMap[guardBody] = guardCount;
+      CounterMap[US] = parent;
+      auto count = loadExecutionCount(US);
+      LoadedCounterMap[US] = subtract(count, guardCount);
+    } else if (auto *WS = dyn_cast<WhileStmt>(S)) {
+      auto whileBody = WS->getBody();
+      CounterMap[whileBody] = NextCounter++;
+      auto whileCount = loadExecutionCount(whileBody);
+      LoadedCounterMap[whileBody] = whileCount;
+      CounterMap[WS] = parent;
+      auto count = loadExecutionCount(WS);
+      LoadedCounterMap[WS] = count;
+    } else if (auto *RWS = dyn_cast<RepeatWhileStmt>(S)) {
+      auto rwsBody = RWS->getBody();
+      CounterMap[rwsBody] = NextCounter++;
+      auto rwsBodyCount = loadExecutionCount(rwsBody);
+      LoadedCounterMap[rwsBody] = rwsBodyCount;
+      CounterMap[RWS] = parent;
+      auto count = loadExecutionCount(RWS);
+      LoadedCounterMap[RWS] = count;
+    } else if (auto *FES = dyn_cast<ForEachStmt>(S)) {
+      auto fesBody = FES->getBody();
+      CounterMap[fesBody] = NextCounter++;
+      auto fesCount = loadExecutionCount(fesBody);
+      LoadedCounterMap[fesBody] = fesCount;
+      CounterMap[FES] = parent;
+      auto count = loadExecutionCount(FES);
+      LoadedCounterMap[FES] = count;
+      walkPatternForProfiling(FES->getIterator(), *this);
+    } else if (auto *SS = dyn_cast<SwitchStmt>(S)) {
+      CounterMap[SS] = NextCounter++;
+      auto ssCount = loadExecutionCount(SS);
+      LoadedCounterMap[SS] = ssCount;
+    } else if (auto *CS = dyn_cast<CaseStmt>(S)) {
+      CounterMap[CS] = NextCounter++;
+      auto csCount = loadExecutionCount(CS);
+      LoadedCounterMap[CS] = csCount;
+    } else if (auto *DCS = dyn_cast<DoCatchStmt>(S)) {
+      CounterMap[DCS] = NextCounter++;
+      auto dcsCount = loadExecutionCount(DCS);
+      LoadedCounterMap[DCS] = dcsCount;
+    } else if (auto *CS = dyn_cast<CatchStmt>(S)) {
+      auto csBody = CS->getBody();
+      CounterMap[csBody] = NextCounter++;
+      auto csBodyCount = loadExecutionCount(csBody);
+      LoadedCounterMap[csBody] = csBodyCount;
+    }
+    return {true, S};
+  }
+
+  std::pair<bool, Expr *> walkToExprPre(Expr *E) override {
+    unsigned parent = getParentCounter();
+    if (auto *IE = dyn_cast<IfExpr>(E)) {
+      auto thenExpr = IE->getThenExpr();
+      CounterMap[thenExpr] = NextCounter++;
+      auto thenCount = loadExecutionCount(thenExpr);
+      LoadedCounterMap[thenExpr] = thenCount;
+      if (auto elseExpr = IE->getElseExpr()) {
+        CounterMap[elseExpr] = parent;
+        auto count = loadExecutionCount(elseExpr);
+        if (!parent) {
+          auto thenVal = thenCount.getValue();
+          for (auto pCount = NextCounter - 1; pCount > 0; --pCount) {
+            auto cCount = LoadedCounts->Counts[pCount];
+            if (cCount > thenVal) {
+              count = cCount;
+              break;
+            }
+          }
+        }
+        LoadedCounterMap[elseExpr] = subtract(count, thenCount);
+      }
+    } else if (isa<AutoClosureExpr>(E) || isa<ClosureExpr>(E)) {
+      CounterMap[E] = NextCounter++;
+      auto eCount = loadExecutionCount(E);
+      LoadedCounterMap[E] = eCount;
+    }
+    return {true, E};
   }
 };
 
@@ -535,14 +724,6 @@ public:
       assignCounter(RWS->getCond(), CounterExpr::Ref(BodyCounter));
       RepeatWhileStack.push_back(RWS);
 
-    } else if (auto *FS = dyn_cast<ForStmt>(S)) {
-      assignCounter(FS, CounterExpr::Zero());
-      if (Expr *E = FS->getCond().getPtrOrNull())
-        assignCounter(E, CounterExpr::Ref(getCurrentCounter()));
-      if (Expr *E = FS->getIncrement().getPtrOrNull())
-        assignCounter(E, CounterExpr::Zero());
-      assignCounter(FS->getBody());
-
     } else if (auto *FES = dyn_cast<ForEachStmt>(S)) {
       assignCounter(FES, CounterExpr::Zero());
       assignCounter(FES->getBody());
@@ -592,13 +773,6 @@ public:
       (void) RWS;
       RepeatWhileStack.pop_back();
 
-    } else if (auto *FS = dyn_cast<ForStmt>(S)) {
-      // Both the condition and the increment are reached through the backedge.
-      if (Expr *E = FS->getCond().getPtrOrNull())
-        addToCounter(E, getExitCounter());
-      if (Expr *E = FS->getIncrement().getPtrOrNull())
-        addToCounter(E, getExitCounter());
-
     } else if (auto *CS = dyn_cast<ContinueStmt>(S)) {
       // Continues create extra backedges, add them to the appropriate counters.
       if (!isa<RepeatWhileStmt>(CS->getTarget()))
@@ -606,9 +780,7 @@ public:
       if (auto *WS = dyn_cast<WhileStmt>(CS->getTarget())) {
         if (auto *E = getConditionNode(WS->getCond()))
           addToCounter(E, getCurrentCounter());
-      } else if (auto *FS = dyn_cast<ForStmt>(CS->getTarget()))
-        if (Expr *E = FS->getCond().getPtrOrNull())
-          addToCounter(E, getCurrentCounter());
+      }
       terminateRegion(S);
 
     } else if (auto *BS = dyn_cast<BreakStmt>(S)) {
@@ -650,7 +822,7 @@ public:
     if (isa<AutoClosureExpr>(E)) {
       // Autoclosures look strange if there isn't a region, since it looks like
       // control flow starts partway through an expression. For now we skip
-      // these so we don't get odd behaviour in default arguments and the like,
+      // these so we don't get odd behavior in default arguments and the like,
       // but in the future we should consider creating appropriate regions for
       // those expressions.
       if (!RegionStack.empty())
@@ -659,7 +831,7 @@ public:
       assignCounter(E);
     } else if (auto *IE = dyn_cast<IfExpr>(E)) {
       CounterExpr &ThenCounter = assignCounter(IE->getThenExpr());
-      if (Parent.isNull())
+      if (RegionStack.empty())
         assignCounter(IE->getElseExpr());
       else
         assignCounter(IE->getElseExpr(),
@@ -694,6 +866,8 @@ getEquivalentPGOLinkage(FormalLinkage Linkage) {
   case FormalLinkage::Private:
     return llvm::GlobalValue::PrivateLinkage;
   }
+
+  llvm_unreachable("Unhandled FormalLinkage in switch.");
 }
 
 void SILGenProfiling::assignRegionCounters(Decl *Root) {
@@ -714,6 +888,10 @@ void SILGenProfiling::assignRegionCounters(Decl *Root) {
     CurrentFuncLinkage = FormalLinkage::HiddenUnique;
   }
 
+  PGOFuncName = llvm::getPGOFuncName(
+      CurrentFuncName, getEquivalentPGOLinkage(CurrentFuncLinkage),
+      CurrentFileName);
+
   walkForProfiling(Root, Mapper);
 
   NumRegionCounters = Mapper.NextCounter;
@@ -728,14 +906,53 @@ void SILGenProfiling::assignRegionCounters(Decl *Root) {
                                    getEquivalentPGOLinkage(CurrentFuncLinkage)),
                                FunctionHash, RegionCounterMap, CurrentFileName);
   }
+
+  if (SGM.PGOReader) {
+    auto LoadedCounts =
+        SGM.PGOReader->getInstrProfRecord(PGOFuncName, FunctionHash);
+    if (auto E = LoadedCounts.takeError()) {
+      llvm::handleAllErrors(std::move(E),
+                            [&E](const llvm::InstrProfError &Err) {
+                              Err.log(llvm::dbgs());
+                              return;
+                            });
+      llvm::dbgs() << PGOFuncName << "\n";
+      return;
+    }
+    PGOMapping pgoMapper(PGORegionLoadedCounterMap, LoadedCounts,
+                         PGORegionCondToParentMap);
+    walkForProfiling(Root, pgoMapper);
+  }
+}
+
+ProfileCounter SILGenProfiling::getExecutionCount(ASTNode Node) {
+  if (!Node) {
+    return ProfileCounter();
+  }
+  auto it = PGORegionLoadedCounterMap.find(Node);
+  if (it == PGORegionLoadedCounterMap.end()) {
+    return ProfileCounter();
+  }
+  return it->getSecond();
+}
+
+Optional<ASTNode> SILGenProfiling::getPGOParent(ASTNode Node) {
+  if (!Node) {
+    return None;
+  }
+  auto it = PGORegionCondToParentMap.find(Node);
+  if (it == PGORegionCondToParentMap.end()) {
+    return None;
+  }
+  return it->getSecond();
 }
 
 static SILLocation getLocation(ASTNode Node) {
-  if (Expr *E = Node.dyn_cast<Expr *>())
+  if (auto *E = Node.dyn_cast<Expr *>())
     return E;
-  else if (Stmt *S = Node.dyn_cast<Stmt *>())
+  else if (auto *S = Node.dyn_cast<Stmt *>())
     return S;
-  else if (Decl *D = Node.dyn_cast<Decl *>())
+  else if (auto *D = Node.dyn_cast<Decl *>())
     return D;
   else
     llvm_unreachable("unsupported ASTNode");

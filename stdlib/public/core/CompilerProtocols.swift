@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 // Intrinsic protocols shared with the compiler
@@ -61,7 +61,7 @@
 /// `OptionSet` protocol. Whether using an option set or creating your own,
 /// you use the raw value of an option set instance to store the instance's
 /// bitfield. The raw value must therefore be of a type that conforms to the
-/// `BitwiseOperations` protocol, such as `UInt8` or `Int`. For example, the
+/// `FixedWidthInteger` protocol, such as `UInt8` or `Int`. For example, the
 /// `Direction` type defines an option set for the four directions you can
 /// move in a game.
 ///
@@ -98,8 +98,6 @@
 ///     // Prints "false"
 ///     print(allowedMoves.rawValue & Directions.right.rawValue)
 ///     // Prints "0"
-///
-/// - SeeAlso: `OptionSet`, `BitwiseOperations`
 public protocol RawRepresentable {
   /// The raw type that can be used to represent all values of the conforming
   /// type.
@@ -150,6 +148,7 @@ public protocol RawRepresentable {
 /// - Parameters:
 ///   - lhs: A raw-representable instance.
 ///   - rhs: A second raw-representable instance.
+@_inlineable // FIXME(sil-serialize-all)
 public func == <T : RawRepresentable>(lhs: T, rhs: T) -> Bool
   where T.RawValue : Equatable {
   return lhs.rawValue == rhs.rawValue
@@ -160,6 +159,7 @@ public func == <T : RawRepresentable>(lhs: T, rhs: T) -> Bool
 /// - Parameters:
 ///   - lhs: A raw-representable instance.
 ///   - rhs: A second raw-representable instance.
+@_inlineable // FIXME(sil-serialize-all)
 public func != <T : RawRepresentable>(lhs: T, rhs: T) -> Bool
   where T.RawValue : Equatable {
   return lhs.rawValue != rhs.rawValue
@@ -172,6 +172,7 @@ public func != <T : RawRepresentable>(lhs: T, rhs: T) -> Bool
 /// - Parameters:
 ///   - lhs: A raw-representable instance.
 ///   - rhs: A second raw-representable instance.
+@_inlineable // FIXME(sil-serialize-all)
 public func != <T : Equatable>(lhs: T, rhs: T) -> Bool
   where T : RawRepresentable, T.RawValue : Equatable {
   return lhs.rawValue != rhs.rawValue
@@ -183,8 +184,6 @@ public func != <T : Equatable>(lhs: T, rhs: T) -> Bool
 /// `Optional` type conforms to `ExpressibleByNilLiteral`.
 /// `ExpressibleByNilLiteral` conformance for types that use `nil` for other
 /// purposes is discouraged.
-///
-/// - SeeAlso: `Optional`
 public protocol ExpressibleByNilLiteral {
   /// Creates an instance initialized with `nil`.
   init(nilLiteral: ())
@@ -194,10 +193,46 @@ public protocol _ExpressibleByBuiltinIntegerLiteral {
   init(_builtinIntegerLiteral value: _MaxBuiltinIntegerType)
 }
 
-/// Conforming types can be initialized with integer literals.
+/// A type that can be initialized with an integer literal.
+///
+/// The standard library integer and floating-point types, such as `Int` and
+/// `Double`, conform to the `ExpressibleByIntegerLiteral` protocol. You can
+/// initialize a variable or constant of any of these types by assigning an
+/// integer literal.
+///
+///     // Type inferred as 'Int'
+///     let cookieCount = 12
+///
+///     // An array of 'Int'
+///     let chipsPerCookie = [21, 22, 25, 23, 24, 19]
+///
+///     // A floating-point value initialized using an integer literal
+///     let redPercentage: Double = 1
+///     // redPercentage == 1.0
+///
+/// Conforming to ExpressibleByIntegerLiteral
+/// =========================================
+///
+/// To add `ExpressibleByIntegerLiteral` conformance to your custom type,
+/// implement the required initializer.
 public protocol ExpressibleByIntegerLiteral {
+  /// A type that represents an integer literal.
+  ///
+  /// The standard library integer and floating-point types are all valid types
+  /// for `IntegerLiteralType`.
   associatedtype IntegerLiteralType : _ExpressibleByBuiltinIntegerLiteral
-  /// Create an instance initialized to `value`.
+
+  /// Creates an instance initialized to the specified integer value.
+  ///
+  /// Do not call this initializer directly. Instead, initialize a variable or
+  /// constant using an integer literal. For example:
+  ///
+  ///     let x = 23
+  ///
+  /// In this example, the assignment to the `x` constant calls this integer
+  /// literal initializer behind the scenes.
+  ///
+  /// - Parameter value: The value to create.
   init(integerLiteral value: IntegerLiteralType)
 }
 
@@ -224,13 +259,23 @@ public protocol _ExpressibleByBuiltinFloatLiteral {
 /// To add `ExpressibleByFloatLiteral` conformance to your custom type,
 /// implement the required initializer.
 public protocol ExpressibleByFloatLiteral {
-  /// A type that can represent a floating-point literal.
+  /// A type that represents a floating-point literal.
   ///
   /// Valid types for `FloatLiteralType` are `Float`, `Double`, and `Float80`
   /// where available.
   associatedtype FloatLiteralType : _ExpressibleByBuiltinFloatLiteral
   
   /// Creates an instance initialized to the specified floating-point value.
+  ///
+  /// Do not call this initializer directly. Instead, initialize a variable or
+  /// constant using a floating-point literal. For example:
+  ///
+  ///     let x = 21.5
+  ///
+  /// In this example, the assignment to the `x` constant calls this
+  /// floating-point literal initializer behind the scenes.
+  ///
+  /// - Parameter value: The value to create.
   init(floatLiteral value: FloatLiteralType)
 }
 
@@ -249,7 +294,7 @@ public protocol _ExpressibleByBuiltinBooleanLiteral {
 /// implement the `init(booleanLiteral:)` initializer that creates an instance
 /// of your type with the given Boolean value.
 public protocol ExpressibleByBooleanLiteral {
-  /// A type that can represent a Boolean literal, such as `Bool`.
+  /// A type that represents a Boolean literal, such as `Bool`.
   associatedtype BooleanLiteralType : _ExpressibleByBuiltinBooleanLiteral
 
   /// Creates an instance initialized to the given Boolean value.
@@ -260,7 +305,7 @@ public protocol ExpressibleByBooleanLiteral {
   ///
   ///     let twasBrillig = true
   ///
-  /// In this example, the assignments to the `twasBrillig` constant calls this
+  /// In this example, the assignment to the `twasBrillig` constant calls this
   /// Boolean literal initializer behind the scenes.
   ///
   /// - Parameter value: The value of the new instance.
@@ -274,12 +319,12 @@ public protocol _ExpressibleByBuiltinUnicodeScalarLiteral {
 /// A type that can be initialized with a string literal containing a single
 /// Unicode scalar value.
 ///
-/// The `String`, `StaticString`, `Character`, and `UnicodeScalar` types all
+/// The `String`, `StaticString`, `Character`, and `Unicode.Scalar` types all
 /// conform to the `ExpressibleByUnicodeScalarLiteral` protocol. You can
 /// initialize a variable of any of these types using a string literal that
 /// holds a single Unicode scalar.
 ///
-///     let ñ: UnicodeScalar = "ñ"
+///     let ñ: Unicode.Scalar = "ñ"
 ///     print(ñ)
 ///     // Prints "ñ"
 ///
@@ -289,14 +334,24 @@ public protocol _ExpressibleByBuiltinUnicodeScalarLiteral {
 /// To add `ExpressibleByUnicodeScalarLiteral` conformance to your custom type,
 /// implement the required initializer.
 public protocol ExpressibleByUnicodeScalarLiteral {
-  /// A type that can represent a Unicode scalar literal.
+  /// A type that represents a Unicode scalar literal.
   ///
-  /// Valid types for `UnicodeScalarLiteralType` are `UnicodeScalar`,
-  /// `String`, and `StaticString`.
+  /// Valid types for `UnicodeScalarLiteralType` are `Unicode.Scalar`,
+  /// `Character`, `String`, and `StaticString`.
   associatedtype UnicodeScalarLiteralType : _ExpressibleByBuiltinUnicodeScalarLiteral
 
   /// Creates an instance initialized to the given value.
+  ///
+  /// - Parameter value: The value of the new instance.
   init(unicodeScalarLiteral value: UnicodeScalarLiteralType)
+}
+
+public protocol _ExpressibleByBuiltinUTF16ExtendedGraphemeClusterLiteral
+  : _ExpressibleByBuiltinExtendedGraphemeClusterLiteral {
+
+  init(
+    _builtinExtendedGraphemeClusterLiteral start: Builtin.RawPointer,
+    utf16CodeUnitCount: Builtin.Word)
 }
 
 public protocol _ExpressibleByBuiltinExtendedGraphemeClusterLiteral
@@ -311,15 +366,15 @@ public protocol _ExpressibleByBuiltinExtendedGraphemeClusterLiteral
 /// A type that can be initialized with a string literal containing a single
 /// extended grapheme cluster.
 ///
-/// An *extended grapheme cluster* is a group of one or more Unicode code
-/// points that approximates a single user-perceived character.  Many
+/// An *extended grapheme cluster* is a group of one or more Unicode scalar
+/// values that approximates a single user-perceived character.  Many
 /// individual characters, such as "é", "김", and "🇮🇳", can be made up of
-/// multiple Unicode code points. These code points are combined by Unicode's
-/// boundary algorithms into extended grapheme clusters.
+/// multiple Unicode scalar values. These code points are combined by
+/// Unicode's boundary algorithms into extended grapheme clusters.
 ///
 /// The `String`, `StaticString`, and `Character` types conform to the
-/// `ExpressibleByExtendedGraphemeClusterLiteral` protocol. You can initialize a
-/// variable or constant of any of these types using a string literal that
+/// `ExpressibleByExtendedGraphemeClusterLiteral` protocol. You can initialize
+/// a variable or constant of any of these types using a string literal that
 /// holds a single character.
 ///
 ///     let snowflake: Character = "❄︎"
@@ -334,7 +389,7 @@ public protocol _ExpressibleByBuiltinExtendedGraphemeClusterLiteral
 public protocol ExpressibleByExtendedGraphemeClusterLiteral
   : ExpressibleByUnicodeScalarLiteral {
 
-  /// A type that can represent an extended grapheme cluster literal.
+  /// A type that represents an extended grapheme cluster literal.
   ///
   /// Valid types for `ExtendedGraphemeClusterLiteralType` are `Character`,
   /// `String`, and `StaticString`.
@@ -342,7 +397,19 @@ public protocol ExpressibleByExtendedGraphemeClusterLiteral
     : _ExpressibleByBuiltinExtendedGraphemeClusterLiteral
   
   /// Creates an instance initialized to the given value.
+  ///
+  /// - Parameter value: The value of the new instance.
   init(extendedGraphemeClusterLiteral value: ExtendedGraphemeClusterLiteralType)
+}
+
+extension ExpressibleByExtendedGraphemeClusterLiteral
+  where ExtendedGraphemeClusterLiteralType == UnicodeScalarLiteralType {
+
+  @_inlineable // FIXME(sil-serialize-all)
+  @_transparent
+  public init(unicodeScalarLiteral value: ExtendedGraphemeClusterLiteralType) {
+    self.init(extendedGraphemeClusterLiteral: value)
+  }
 }
 
 public protocol _ExpressibleByBuiltinStringLiteral
@@ -362,6 +429,18 @@ public protocol _ExpressibleByBuiltinUTF16StringLiteral
     utf16CodeUnitCount: Builtin.Word)
 }
 
+public protocol _ExpressibleByBuiltinConstStringLiteral
+  : _ExpressibleByBuiltinExtendedGraphemeClusterLiteral {
+
+  init(_builtinConstStringLiteral constantString: Builtin.RawPointer)
+}
+
+public protocol _ExpressibleByBuiltinConstUTF16StringLiteral
+  : _ExpressibleByBuiltinConstStringLiteral {
+
+  init(_builtinConstUTF16StringLiteral constantUTF16String: Builtin.RawPointer)
+}
+
 /// A type that can be initialized with a string literal.
 ///
 /// The `String` and `StaticString` types conform to the
@@ -377,16 +456,26 @@ public protocol _ExpressibleByBuiltinUTF16StringLiteral
 /// implement the required initializer.
 public protocol ExpressibleByStringLiteral
   : ExpressibleByExtendedGraphemeClusterLiteral {
-  // FIXME: when we have default function implementations in protocols, provide
-  // an implementation of init(extendedGraphemeClusterLiteral:).
   
-  /// A type that can represent a string literal.
+  /// A type that represents a string literal.
   ///
   /// Valid types for `StringLiteralType` are `String` and `StaticString`.
   associatedtype StringLiteralType : _ExpressibleByBuiltinStringLiteral
   
   /// Creates an instance initialized to the given string value.
+  ///
+  /// - Parameter value: The value of the new instance.
   init(stringLiteral value: StringLiteralType)
+}
+
+extension ExpressibleByStringLiteral
+  where StringLiteralType == ExtendedGraphemeClusterLiteralType {
+
+  @_inlineable // FIXME(sil-serialize-all)
+  @_transparent
+  public init(extendedGraphemeClusterLiteral value: StringLiteralType) {
+    self.init(stringLiteral: value)
+  }
 }
 
 /// A type that can be initialized using an array literal.
@@ -421,8 +510,8 @@ public protocol ExpressibleByStringLiteral
 ///   initialize a type that conforms to `ExpressibleByArrayLiteral` simply by
 ///   assigning an existing array.
 ///
-///         let anotherSet: Set = employeesArray
-///         // error: cannot convert value of type '[String]' to specified type 'Set'
+///       let anotherSet: Set = employeesArray
+///       // error: cannot convert value of type '[String]' to specified type 'Set'
 ///
 /// Type Inference of Array Literals
 /// ================================
@@ -500,9 +589,9 @@ public protocol ExpressibleByStringLiteral
 ///     }
 public protocol ExpressibleByArrayLiteral {
   /// The type of the elements of an array literal.
-  associatedtype Element
+  associatedtype ArrayLiteralElement
   /// Creates an instance initialized with the given elements.
-  init(arrayLiteral elements: Element...)
+  init(arrayLiteral elements: ArrayLiteralElement...)
 }
 
 /// A type that can be initialized using a dictionary literal.
@@ -589,30 +678,8 @@ public protocol ExpressibleByDictionaryLiteral {
 /// Conforming to the ExpressibleByStringInterpolation Protocol
 /// ===========================================================
 ///
-/// To use string interpolation to initialize instances of your custom type,
-/// implement the required initializers for `ExpressibleByStringInterpolation`
-/// conformance. String interpolation is a multiple-step initialization
-/// process. When you use string interpolation, the following steps occur:
-///
-/// 1. The string literal is broken into pieces. Each segment of the string
-///    literal before, between, and after any included expressions, along with
-///    the individual expressions themselves, are passed to the
-///    `init(stringInterpolationSegment:)` initializer.
-/// 2. The results of those calls are passed to the
-///    `init(stringInterpolation:)` initializer in the order in which they
-///    appear in the string literal.
-///
-/// In other words, initializing the `message` constant in the example above
-/// using string interpolation is equivalent to the following code:
-///
-///     let message = String(stringInterpolation:
-///           String(stringInterpolationSegment: "One cookie: $"),
-///           String(stringInterpolationSegment: price),
-///           String(stringInterpolationSegment: ", "),
-///           String(stringInterpolationSegment: number),
-///           String(stringInterpolationSegment: " cookies: $"),
-///           String(stringInterpolationSegment: price * number),
-///           String(stringInterpolationSegment: "."))
+/// The `ExpressibleByStringInterpolation` protocol is deprecated. Do not add
+/// new conformances to the protocol.
 @available(*, deprecated, message: "it will be replaced or redesigned in Swift 4.0.  Instead of conforming to 'ExpressibleByStringInterpolation', consider adding an 'init(_:String)'")
 public typealias ExpressibleByStringInterpolation = _ExpressibleByStringInterpolation
 public protocol _ExpressibleByStringInterpolation {
@@ -652,21 +719,46 @@ public protocol _ExpressibleByStringInterpolation {
   init<T>(stringInterpolationSegment expr: T)
 }
 
-/// Conforming types can be initialized with color literals (e.g.
+/// A type that can be initialized using a color literal (e.g.
 /// `#colorLiteral(red: 1, green: 0, blue: 0, alpha: 1)`).
 public protocol _ExpressibleByColorLiteral {
-  init(colorLiteralRed red: Float, green: Float, blue: Float, alpha: Float)
+  /// Creates an instance initialized with the given properties of a color
+  /// literal.
+  ///
+  /// Do not call this initializer directly. Instead, initialize a variable or
+  /// constant using a color literal.
+  init(_colorLiteralRed red: Float, green: Float, blue: Float, alpha: Float)
 }
 
-/// Conforming types can be initialized with image literals (e.g.
+extension _ExpressibleByColorLiteral {
+  @_inlineable // FIXME(sil-serialize-all)
+  @available(swift, deprecated: 3.2, obsoleted: 4.0,
+    message: "This initializer is only meant to be used by color literals")
+  public init(
+    colorLiteralRed red: Float, green: Float, blue: Float, alpha: Float
+  ) {
+    self.init(
+      _colorLiteralRed: red, green: green, blue: blue, alpha: alpha)
+  }
+}
+
+/// A type that can be initialized using an image literal (e.g.
 /// `#imageLiteral(resourceName: "hi.png")`).
 public protocol _ExpressibleByImageLiteral {
+  /// Creates an instance initialized with the given resource name.
+  ///
+  /// Do not call this initializer directly. Instead, initialize a variable or
+  /// constant using an image literal.
   init(imageLiteralResourceName path: String)
 }
 
-/// Conforming types can be initialized with strings (e.g.
+/// A type that can be initialized using a file reference literal (e.g.
 /// `#fileLiteral(resourceName: "resource.txt")`).
 public protocol _ExpressibleByFileReferenceLiteral {
+  /// Creates an instance initialized with the given resource name.
+  ///
+  /// Do not call this initializer directly. Instead, initialize a variable or
+  /// constant using a file reference literal.
   init(fileReferenceLiteralResourceName path: String)
 }
 
@@ -684,9 +776,6 @@ public protocol _ExpressibleByFileReferenceLiteral {
 /// then Array would no longer be a _DestructorSafeContainer.
 public protocol _DestructorSafeContainer {
 }
-
-@available(*, unavailable, renamed: "Bool")
-public typealias BooleanType = Bool
 
 // Deprecated by SE-0115.
 

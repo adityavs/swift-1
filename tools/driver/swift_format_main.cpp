@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -21,7 +21,6 @@
 #include "swift/IDE/Formatting.h"
 #include "swift/Option/Options.h"
 #include "swift/Subsystems.h"
-#include "clang/Format/Format.h"
 #include "llvm/Option/Arg.h"
 #include "llvm/Option/Option.h"
 #include "llvm/Support/CommandLine.h"
@@ -43,14 +42,20 @@ private:
   std::unique_ptr<ParserUnit> Parser;
   class FormatterDiagConsumer : public swift::DiagnosticConsumer {
     void handleDiagnostic(SourceManager &SM, SourceLoc Loc, DiagnosticKind Kind,
-                          StringRef Text,
+                          StringRef FormatString,
+                          ArrayRef<DiagnosticArgument> FormatArgs,
                           const swift::DiagnosticInfo &Info) override {
-      llvm::errs() << "Parse error: " << Text << "\n";
+      llvm::errs() << "Parse error: ";
+      DiagnosticEngine::formatDiagnosticText(llvm::errs(), FormatString,
+                                             FormatArgs);
+      llvm::errs() << "\n";
     }
   } DiagConsumer;
 
 public:
   FormatterDocument(std::unique_ptr<llvm::MemoryBuffer> Buffer) {
+    // Formatting logic requires tokens on source file.
+    CompInv.getLangOptions().KeepTokensInSourceFile = true;
     updateCode(std::move(Buffer));
   }
 
@@ -80,10 +85,8 @@ private:
   std::string MainExecutablePath;
   std::string OutputFilename = "-";
   std::vector<std::string> InputFilenames;
-  bool UseTabs = false;
+  CodeFormatOptions FormatOptions;
   bool InPlace = false;
-  unsigned TabWidth = 4;
-  unsigned IndentWidth = 4;
   std::vector<std::string> LineRanges;
 
   bool parseLineRange(StringRef Input, unsigned &FromLine, unsigned &ToLine) {
@@ -93,9 +96,8 @@ private:
   }
 
 public:
-  void setMainExecutablePath(const std::string &Path) {
-    MainExecutablePath = Path;
-  }
+  SwiftFormatInvocation(const std::string &ExecPath)
+      : MainExecutablePath(ExecPath) {}
 
   const std::string &getOutputFilename() { return OutputFilename; }
 
@@ -118,28 +120,29 @@ public:
     }
 
     if (ParsedArgs.getLastArg(OPT_use_tabs))
-      UseTabs = true;
+      FormatOptions.UseTabs = true;
+
+    if (ParsedArgs.getLastArg(OPT_indent_switch_case))
+      FormatOptions.IndentSwitchCase = true;
 
     if (ParsedArgs.getLastArg(OPT_in_place))
       InPlace = true;
 
     if (const Arg *A = ParsedArgs.getLastArg(OPT_tab_width))
-      if (StringRef(A->getValue()).getAsInteger(10, TabWidth))
+      if (StringRef(A->getValue()).getAsInteger(10, FormatOptions.TabWidth))
         Diags.diagnose(SourceLoc(), diag::error_invalid_arg_value,
                        A->getAsString(ParsedArgs), A->getValue());
 
     if (const Arg *A = ParsedArgs.getLastArg(OPT_indent_width))
-      if (StringRef(A->getValue()).getAsInteger(10, IndentWidth))
+      if (StringRef(A->getValue()).getAsInteger(10, FormatOptions.IndentWidth))
         Diags.diagnose(SourceLoc(), diag::error_invalid_arg_value,
                        A->getAsString(ParsedArgs), A->getValue());
 
-    for (const Arg *A : make_range(ParsedArgs.filtered_begin(OPT_line_range),
-                                   ParsedArgs.filtered_end()))
+    for (const Arg *A : ParsedArgs.filtered(OPT_line_range))
       LineRanges.push_back(A->getValue());
 
     if (ParsedArgs.hasArg(OPT_UNKNOWN)) {
-      for (const Arg *A : make_range(ParsedArgs.filtered_begin(OPT_UNKNOWN),
-                                     ParsedArgs.filtered_end())) {
+      for (const Arg *A : ParsedArgs.filtered(OPT_UNKNOWN)) {
         Diags.diagnose(SourceLoc(), diag::error_unknown_arg,
                        A->getAsString(ParsedArgs));
       }
@@ -153,14 +156,8 @@ public:
       return 1;
     }
 
-    for (const Arg *A : make_range(ParsedArgs.filtered_begin(OPT_INPUT),
-                                   ParsedArgs.filtered_end())) {
+    for (const Arg *A : ParsedArgs.filtered(OPT_INPUT)) {
       InputFilenames.push_back(A->getValue());
-    }
-
-    if (InputFilenames.empty()) {
-      Diags.diagnose(SourceLoc(), diag::error_mode_requires_an_input_file);
-      return 1;
     }
 
     if (const Arg *A = ParsedArgs.getLastArg(OPT_o)) {
@@ -187,8 +184,8 @@ public:
     if (LineRanges.empty()) {
       LineRanges.push_back("1:" + std::to_string(UINT_MAX));
     }
+
     std::string Output = Doc.memBuffer().getBuffer();
-    clang::tooling::Replacements Replacements;
     for (unsigned Range = 0; Range < LineRanges.size(); ++Range) {
       unsigned FromLine;
       unsigned ToLine;
@@ -206,34 +203,13 @@ public:
         if (Length < 0)
           break;
 
-        CodeFormatOptions FormatOptions;
-        FormatOptions.UseTabs = UseTabs;
-        FormatOptions.IndentWidth = IndentWidth;
-        FormatOptions.TabWidth = TabWidth;
         std::string Formatted =
             Doc.reformat(LineRange(Line, 1), FormatOptions).second;
         if (Formatted.find_first_not_of(" \t\v\f", 0) == StringRef::npos)
           Formatted = "";
 
-        if (Formatted == Output.substr(Offset, Length))
-          continue;
-
         Output.replace(Offset, Length, Formatted);
-        Doc.updateCode(llvm::MemoryBuffer::getMemBuffer(Output));
-
-        // TODO: Replacements::add returns a failure when there is a conflict in
-        // between the replacement we are adding and the replacements that have
-        // already been added or if the added replacement's file path is
-        // different from the filepath of the existing replacements. We should
-        // add a first class diagnostic for this. For now, due to time
-        // constraints, on failure, we just log a message to std::err and return
-        // true.
-        llvm::Error Error = Replacements.add(
-            clang::tooling::Replacement(Filename, Offset, Length, Formatted));
-        if (!Error) {
-          llvm::errs() << "Error! Invalid replacement!\n";
-          return true;
-        }
+        Doc.updateCode(llvm::MemoryBuffer::getMemBuffer(Output));        
       }
       if (Filename == "-" || (!InPlace && OutputFilename == "-")) {
         llvm::outs() << Output;
@@ -264,14 +240,12 @@ int swift_format_main(ArrayRef<const char *> Args, const char *Argv0,
   PrintingDiagnosticConsumer PDC;
   Instance.addDiagnosticConsumer(&PDC);
 
-  SwiftFormatInvocation Invocation;
-  std::string MainExecutablePath =
-      llvm::sys::fs::getMainExecutable(Argv0, MainAddr);
-  Invocation.setMainExecutablePath(MainExecutablePath);
+  SwiftFormatInvocation Invocation(
+      llvm::sys::fs::getMainExecutable(Argv0, MainAddr));
 
   DiagnosticEngine &Diags = Instance.getDiags();
   if (Invocation.parseArgs(Args, Diags) != 0)
-    return 1;
+    return EXIT_FAILURE;
 
   std::vector<std::string> InputFiles = Invocation.getInputFilenames();
   unsigned NumInputFiles = InputFiles.size();
@@ -285,10 +259,11 @@ int swift_format_main(ArrayRef<const char *> Args, const char *Argv0,
       // We don't support formatting file ranges for multiple files.
       Instance.getDiags().diagnose(SourceLoc(),
                                    diag::error_formatting_multiple_file_ranges);
-      return 1;
+      return EXIT_FAILURE;
     }
     for (unsigned i = 0; i < NumInputFiles; ++i)
       Invocation.format(InputFiles[i], Diags);
   }
-  return 0;
+
+  return EXIT_SUCCESS;
 }

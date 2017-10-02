@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -125,7 +125,7 @@ private:
   /// NOTE: we do not use the same ValueEnumerator for the alias cache, 
   /// as when either cache is cleared, we can not clear the ValueEnumerator
   /// because doing so could give rise to collisions in the other cache.
-  ValueEnumerator<ValueBase*> MemoryBehaviorValueBaseToIndex;
+  ValueEnumerator<SILNode*> MemoryBehaviorNodeToIndex;
 
   AliasResult aliasAddressProjection(SILValue V1, SILValue V2,
                                      SILValue O1, SILValue O2);
@@ -138,12 +138,17 @@ private:
   /// Returns True if memory of type \p T1 and \p T2 may alias.
   bool typesMayAlias(SILType T1, SILType T2);
 
-  virtual void handleDeleteNotification(ValueBase *I) override {
-    // The pointer I is going away.  We can't scan the whole cache and remove
-    // all of the occurrences of the pointer. Instead we remove the pointer
-    // from the cache that translates pointers to indices.
-    AliasValueBaseToIndex.invalidateValue(I);
-    MemoryBehaviorValueBaseToIndex.invalidateValue(I);
+  virtual void handleDeleteNotification(SILNode *node) override {
+    assert(node->isCanonicalSILNodeInObject());
+
+    // The pointer 'node' is going away.  We can't scan the whole cache
+    // and remove all of the occurrences of the pointer. Instead we remove
+    // the pointer from the cache that translates pointers to indices.
+    auto value = dyn_cast<ValueBase>(node);
+    if (!value) return;
+
+    AliasValueBaseToIndex.invalidateValue(value);
+    MemoryBehaviorNodeToIndex.invalidateValue(node);
   }
 
   virtual bool needsNotifications() override { return true; }
@@ -261,17 +266,27 @@ public:
   AliasKeyTy toAliasKey(SILValue V1, SILValue V2, SILType Type1, SILType Type2);
 
   /// Encodes the memory behavior query as a MemBehaviorKeyTy.
-  MemBehaviorKeyTy toMemoryBehaviorKey(SILValue V1, SILValue V2, RetainObserveKind K);
+  MemBehaviorKeyTy toMemoryBehaviorKey(SILInstruction *V1, SILValue V2,
+                                       RetainObserveKind K);
 
-  virtual void invalidate(SILAnalysis::InvalidationKind K) override {
+  virtual void invalidate() override {
     AliasCache.clear();
     MemoryBehaviorCache.clear();
   }
 
   virtual void invalidate(SILFunction *,
                           SILAnalysis::InvalidationKind K) override {
-    invalidate(K);
+    invalidate();
   }
+
+  /// Notify the analysis about a newly created function.
+  virtual void notifyAddFunction(SILFunction *F) override { }
+
+  /// Notify the analysis about a function which will be deleted from the
+  /// module.
+  virtual void notifyDeleteFunction(SILFunction *F) override { }
+
+  virtual void invalidateFunctionTables() override { }
 };
 
 

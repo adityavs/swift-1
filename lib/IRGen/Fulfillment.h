@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -66,17 +66,10 @@ public:
     virtual GenericSignature::ConformsToArray
       getInterestingConformances(CanType type) const = 0;
 
-    virtual ~InterestingKeysCallback() = default;
-  };
+    /// Return the limited interesting conformances for an interesting type.
+    virtual CanType getSuperclassBound(CanType type) const = 0;
 
-  /// An implementation of InterestingKeysCallback that returns everything
-  /// fulfillable.
-  struct Everything : InterestingKeysCallback {
-    bool isInterestingType(CanType type) const override;
-    bool hasInterestingType(CanType type) const override;
-    bool hasLimitedInterestingConformances(CanType type) const override;
-    GenericSignature::ConformsToArray
-      getInterestingConformances(CanType type) const override;
+    virtual ~InterestingKeysCallback() = default;
   };
 
   FulfillmentMap() = default;
@@ -140,18 +133,9 @@ public:
   }
 
 private:
-  bool searchParentTypeMetadata(IRGenModule &IGM, NominalTypeDecl *typeDecl,
-                                CanType parent,
-                                unsigned source, MetadataPath &&path,
-                                const InterestingKeysCallback &keys);
-
-  bool searchNominalTypeMetadata(IRGenModule &IGM, CanNominalType type,
+  bool searchNominalTypeMetadata(IRGenModule &IGM, CanType type,
                                  unsigned source, MetadataPath &&path,
                                  const InterestingKeysCallback &keys);
-
-  bool searchBoundGenericTypeMetadata(IRGenModule &IGM, CanBoundGenericType type,
-                                      unsigned source, MetadataPath &&path,
-                                      const InterestingKeysCallback &keys);
 
   /// Search the given witness table for useful fulfillments.
   ///
@@ -168,5 +152,3 @@ private:
 }
 
 #endif
-
-

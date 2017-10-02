@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -299,6 +299,8 @@ public:
         case EscapeState::Global:
           return true;
       }
+
+      llvm_unreachable("Unhandled EscapeState in switch.");
     }
 
     /// Returns the content node if of this node if it exists in the graph.
@@ -375,8 +377,11 @@ public:
     /// NodeType::Return.
     CGNode *ReturnNode = nullptr;
 
+    /// The list of use points.
+    llvm::SmallVector<SILNode *, 16> UsePointTable;
+
     /// Mapping of use points to bit indices in CGNode::UsePoints.
-    llvm::DenseMap<ValueBase *, int> UsePoints;
+    llvm::DenseMap<SILNode *, int> UsePoints;
 
     /// The allocator for nodes.
     llvm::SpecificBumpPtrAllocator<CGNode> NodeAllocator;
@@ -481,13 +486,16 @@ public:
     }
 
     /// Adds an argument/instruction in which the node's value is used.
-    int addUsePoint(CGNode *Node, ValueBase *V) {
+    int addUsePoint(CGNode *Node, SILNode *User) {
       if (Node->getEscapeState() >= EscapeState::Global)
         return -1;
 
+      User = User->getCanonicalSILNodeInObject();
       int Idx = (int)UsePoints.size();
-      assert(UsePoints.count(V) == 0 && "value is already a use-point");
-      UsePoints[V] = Idx;
+      assert(UsePoints.count(User) == 0 && "value is already a use-point");
+      UsePoints[User] = Idx;
+      UsePointTable.push_back(User);
+      assert(UsePoints.size() == UsePointTable.size());
       Node->setUsePointBit(Idx);
       return Idx;
     }
@@ -560,11 +568,15 @@ public:
       return Node->UsePoints.count();
     }
 
-    /// Returns true if \p V is a use of \p Node, i.e. V may (indirectly)
-    /// somehow refer to the Node's value.
+    /// Returns true if \p UsePoint is a use of \p Node, i.e. UsePoint may
+    /// (indirectly) somehow refer to the Node's value.
     /// Use-points are only values which are relevant for lifeness computation,
     /// e.g. release or apply instructions.
-    bool isUsePoint(ValueBase *V, CGNode *Node);
+    bool isUsePoint(SILNode *UsePoint, CGNode *Node);
+
+    /// Returns all use points of \p Node in \p UsePoints.
+    void getUsePoints(CGNode *Node,
+                      llvm::SmallVectorImpl<SILNode *> &UsePoints);
 
     /// Computes the use point information.
     void computeUsePoints();
@@ -660,9 +672,9 @@ private:
   /// See EscapeAnalysis::NodeType::Value.
   bool isPointer(ValueBase *V);
 
-  /// If V is a pointer, set it to global escaping.
-  void setEscapesGlobal(ConnectionGraph *ConGraph, ValueBase *V) {
-    if (CGNode *Node = ConGraph->getNode(V, this))
+  /// If \p pointer is a pointer, set it to global escaping.
+  void setEscapesGlobal(ConnectionGraph *ConGraph, ValueBase *pointer) {
+    if (CGNode *Node = ConGraph->getNode(pointer, this))
       ConGraph->setEscapesGlobal(Node);
   }
 
@@ -695,14 +707,14 @@ private:
   void buildConnectionGraph(FunctionInfo *FInfo, FunctionOrder &BottomUpOrder,
                             int RecursionDepth);
 
-  /// Updates the graph by analysing instruction \p I.
+  /// Updates the graph by analyzing instruction \p I.
   /// Visited callees are added to \p BottomUpOrder until \p RecursionDepth
   /// reaches MaxRecursionDepth.
   void analyzeInstruction(SILInstruction *I, FunctionInfo *FInfo,
                           FunctionOrder &BottomUpOrder,
                           int RecursionDepth);
 
-  /// Updates the graph by analysing instruction \p SI, which may be a
+  /// Updates the graph by analyzing instruction \p SI, which may be a
   /// select_enum, select_enum_addr or select_value.
   template<class SelectInst>
   void analyzeSelectInst(SelectInst *SI, ConnectionGraph *ConGraph);
@@ -729,7 +741,7 @@ private:
 
   /// Returns true if the value \p V can escape to the \p UsePoint, where
   /// \p UsePoint is either a release-instruction or a function call.
-  bool canEscapeToUsePoint(SILValue V, ValueBase *UsePoint,
+  bool canEscapeToUsePoint(SILValue V, SILNode *UsePoint,
                            ConnectionGraph *ConGraph);
 
   friend struct ::CGForDotView;
@@ -789,11 +801,25 @@ public:
   /// node, the pointers do not alias.
   bool canPointToSameMemory(SILValue V1, SILValue V2);
 
-  virtual void invalidate(InvalidationKind K) override;
+  /// Invalidate all information in this analysis.
+  virtual void invalidate() override;
 
+  /// Invalidate all of the information for a specific function.
   virtual void invalidate(SILFunction *F, InvalidationKind K) override;
 
-  virtual void handleDeleteNotification(ValueBase *I) override;
+  /// Notify the analysis about a newly created function.
+  virtual void notifyAddFunction(SILFunction *F) override { }
+
+  /// Notify the analysis about a function which will be deleted from the
+  /// module.
+  virtual void notifyDeleteFunction(SILFunction *F) override {
+    invalidate(F, InvalidationKind::Nothing);
+  }
+
+  /// Notify the analysis about changed witness or vtables.
+  virtual void invalidateFunctionTables() override { }
+
+  virtual void handleDeleteNotification(SILNode *N) override;
 
   virtual bool needsNotifications() override { return true; }
 

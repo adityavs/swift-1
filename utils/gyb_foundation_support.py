@@ -40,11 +40,12 @@ extension {Type}: _ObjectiveCBridgeable {{
 }}
 """.format(Type=Type)
 
+
 def ObjectiveCBridgeableImplementationForNSValueWithCategoryMethods(
-  Type,
-  initializer,
-  getter,
-  objCType="_getObjCTypeEncoding"
+    Type,
+    initializer,
+    getter,
+    objCType="_getObjCTypeEncoding"
 ):
     return """
 extension {Type}: _ObjectiveCBridgeable {{

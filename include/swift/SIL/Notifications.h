@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -15,7 +15,7 @@
 
 namespace swift {
 
-class ValueBase;
+class SILNode;
 
 /// A protocol (or interface) for handling value deletion notifications.
 ///
@@ -29,7 +29,7 @@ struct DeleteNotificationHandler {
   virtual ~DeleteNotificationHandler() {}
 
   /// Handle the invalidation message for the value \p Value.
-  virtual void handleDeleteNotification(swift::ValueBase *Value) { }
+  virtual void handleDeleteNotification(SILNode *value) { }
 
   /// Returns True if the pass, analysis or other entity wants to receive
   /// notifications. This callback is called once when the class is being

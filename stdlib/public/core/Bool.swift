@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 // Bool Datatype and Supporting Operators
@@ -14,10 +14,9 @@
 
 /// A value type whose instances are either `true` or `false`.
 ///
-/// `Bool` represents Boolean values in Swift. Create instances of
-/// `Bool` by using one of the Boolean literals `true` and `false` or by
-/// assigning the result of a Boolean method or operation to a variable or
-/// constant.
+/// `Bool` represents Boolean values in Swift. Create instances of `Bool` by
+/// using one of the Boolean literals `true` or `false`, or by assigning the
+/// result of a Boolean method or operation to a variable or constant.
 ///
 ///     var godotHasArrived = false
 ///
@@ -26,15 +25,15 @@
 ///     print(containsTen)
 ///     // Prints "false"
 ///
-///     let (a, b) == (100, 101)
+///     let (a, b) = (100, 101)
 ///     let aFirst = a < b
 ///     print(aFirst)
 ///     // Prints "true"
 ///
 /// Swift uses only simple Boolean values in conditional contexts to help avoid
 /// accidental programming errors and to help maintain the clarity of each
-/// control statement. Unlike other programming languages, in Swift integers
-/// and strings cannot be used where a Boolean value is expected.
+/// control statement. Unlike in other programming languages, in Swift, integers
+/// and strings cannot be used where a Boolean value is required.
 ///
 /// For example, the following code sample does not compile, because it
 /// attempts to use the integer `i` in a logical context:
@@ -52,30 +51,46 @@
 ///         print(i)
 ///         i -= 1
 ///     }
+///
+/// Using Imported Boolean values
+/// =============================
+///
+/// The C `bool` and `Boolean` types and the Objective-C `BOOL` type are all
+/// bridged into Swift as `Bool`. The single `Bool` type in Swift guarantees
+/// that functions, methods, and properties imported from C and Objective-C
+/// have a consistent type interface.
 @_fixed_layout
 public struct Bool {
+  @_versioned
   internal var _value: Builtin.Int1
 
   /// Creates an instance initialized to `false`.
   ///
-  /// Don't call this initializer directly. Instead, use the Boolean literal
+  /// Do not call this initializer directly. Instead, use the Boolean literal
   /// `false` to create a new `Bool` instance.
+  @_inlineable // FIXME(sil-serialize-all)
   @_transparent
   public init() {
     let zero: Int8 = 0
     self._value = Builtin.trunc_Int8_Int1(zero._value)
   }
 
+  @_inlineable // FIXME(sil-serialize-all)
   @_versioned
   @_transparent
   internal init(_ v: Builtin.Int1) { self._value = v }
   
+  /// Creates an instance equal to the given Boolean value.
+  ///
+  /// - Parameter value: The Boolean value to copy.
+  @_inlineable // FIXME(sil-serialize-all)
   public init(_ value: Bool) {
     self = value
   }
 }
 
 extension Bool : _ExpressibleByBuiltinBooleanLiteral, ExpressibleByBooleanLiteral {
+  @_inlineable // FIXME(sil-serialize-all)
   @_transparent
   public init(_builtinBooleanLiteral value: Builtin.Int1) {
     self._value = value
@@ -85,7 +100,7 @@ extension Bool : _ExpressibleByBuiltinBooleanLiteral, ExpressibleByBooleanLitera
   ///
   /// Do not call this initializer directly. It is used by the compiler when
   /// you use a Boolean literal. Instead, create a new `Bool` instance by
-  /// using one of the Boolean literals `true` and `false`.
+  /// using one of the Boolean literals `true` or `false`.
   ///
   ///     var printedMessage = false
   ///
@@ -99,6 +114,7 @@ extension Bool : _ExpressibleByBuiltinBooleanLiteral, ExpressibleByBooleanLitera
   /// this Boolean literal initializer behind the scenes.
   ///
   /// - Parameter value: The value of the new instance.
+  @_inlineable // FIXME(sil-serialize-all)
   @_transparent
   public init(booleanLiteral value: Bool) {
     self = value
@@ -107,6 +123,7 @@ extension Bool : _ExpressibleByBuiltinBooleanLiteral, ExpressibleByBooleanLitera
 
 extension Bool {
   // This is a magic entry point known to the compiler.
+  @_inlineable // FIXME(sil-serialize-all)
   @_transparent
   public // COMPILER_INTRINSIC
   func _getBuiltinLogicValue() -> Builtin.Int1 {
@@ -116,17 +133,18 @@ extension Bool {
 
 extension Bool : CustomStringConvertible {
   /// A textual representation of the Boolean value.
+  @_inlineable // FIXME(sil-serialize-all)
   public var description: String {
     return self ? "true" : "false"
   }
 }
 
 // This is a magic entry point known to the compiler.
+@_inlineable // FIXME(sil-serialize-all)
 @_transparent
 public // COMPILER_INTRINSIC
 func _getBool(_ v: Builtin.Int1) -> Bool { return Bool(v) }
 
-@_transparent
 extension Bool : Equatable, Hashable {
   /// The hash value for the Boolean value.
   ///
@@ -135,11 +153,13 @@ extension Bool : Equatable, Hashable {
   /// - Note: The hash value is not guaranteed to be stable across different
   ///   invocations of the same program. Do not persist the hash value across
   ///   program runs.
-  /// - SeeAlso: `Hashable`
+  @_inlineable // FIXME(sil-serialize-all)
+  @_transparent
   public var hashValue: Int {
     return self ? 1 : 0
   }
 
+  @_inlineable // FIXME(sil-serialize-all)
   @_transparent
   public static func == (lhs: Bool, rhs: Bool) -> Bool {
     return Bool(Builtin.cmp_eq_Int1(lhs._value, rhs._value))
@@ -147,6 +167,13 @@ extension Bool : Equatable, Hashable {
 }
 
 extension Bool : LosslessStringConvertible {
+  /// Creates a new Boolean value from the given string.
+  ///
+  /// If the `description` value is any string other than `"true"` or
+  /// `"false"`, the result is `nil`. This initializer is case sensitive.
+  ///
+  /// - Parameter description: A string representation of the Boolean value.
+  @_inlineable // FIXME(sil-serialize-all)
   public init?(_ description: String) {
     if description == "true" {
       self = true
@@ -178,6 +205,7 @@ extension Bool {
   ///     // Prints "You look nice today!"
   ///
   /// - Parameter a: The Boolean value to negate.
+  @_inlineable // FIXME(sil-serialize-all)
   @_transparent
   public static prefix func ! (a: Bool) -> Bool {
     return Bool(Builtin.xor_Int1(a._value, true._value))
@@ -185,9 +213,9 @@ extension Bool {
 }
 
 extension Bool {
-  /// Performs a logical AND operation on two Bool values.
+  /// Performs a logical AND operation on two Boolean values.
   ///
-  /// The logical AND operator (`&&`) combines two Bool values and returns
+  /// The logical AND operator (`&&`) combines two Boolean values and returns
   /// `true` if both of the values are `true`. If either of the values is
   /// `false`, the operator returns `false`.
   ///
@@ -217,16 +245,17 @@ extension Bool {
   /// - Parameters:
   ///   - lhs: The left-hand side of the operation.
   ///   - rhs: The right-hand side of the operation.
+  @_inlineable // FIXME(sil-serialize-all)
   @_transparent
   @inline(__always)
   public static func && (lhs: Bool, rhs: @autoclosure () throws -> Bool) rethrows
-      -> Bool{
+      -> Bool {
     return lhs ? try rhs() : false
   }
 
-  /// Performs a logical OR operation on two Bool values.
+  /// Performs a logical OR operation on two Boolean values.
   ///
-  /// The logical OR operator (`||`) combines two Bool values and returns
+  /// The logical OR operator (`||`) combines two Boolean values and returns
   /// `true` if at least one of the values is `true`. If both values are
   /// `false`, the operator returns `false`.
   ///
@@ -242,7 +271,7 @@ extension Bool {
   ///     } else {
   ///         print("Major error: \(error)")
   ///     }
-  ///     // Prints "No major errors detected")
+  ///     // Prints "No major errors detected"
   ///
   /// In this example, `lhs` tests whether `error` is an empty string.
   /// Evaluation of the `||` operator is one of the following:
@@ -257,6 +286,7 @@ extension Bool {
   /// - Parameters:
   ///   - lhs: The left-hand side of the operation.
   ///   - rhs: The right-hand side of the operation.
+  @_inlineable // FIXME(sil-serialize-all)
   @_transparent
   @inline(__always)
   public static func || (lhs: Bool, rhs: @autoclosure () throws -> Bool) rethrows

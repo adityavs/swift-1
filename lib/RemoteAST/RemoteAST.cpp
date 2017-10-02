@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -21,7 +21,10 @@
 #include "swift/AST/Decl.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/NameLookup.h"
+#include "swift/AST/SubstitutionMap.h"
 #include "swift/AST/Types.h"
+#include "swift/AST/TypeRepr.h"
+#include "swift/Basic/Mangler.h"
 #include "swift/ClangImporter/ClangImporter.h"
 
 // TODO: Develop a proper interface for this.
@@ -122,7 +125,8 @@ public:
   }
 
   NominalTypeDecl *createNominalTypeDecl(StringRef mangledName) {
-    auto node = Demangle::demangleTypeAsNode(mangledName);
+    Demangle::Demangler Dem;
+    Demangle::NodePointer node = Dem.demangleType(mangledName);
     if (!node) return nullptr;
 
     return createNominalTypeDecl(node);
@@ -130,9 +134,17 @@ public:
 
   NominalTypeDecl *createNominalTypeDecl(const Demangle::NodePointer &node);
 
+  Type createNominalType(NominalTypeDecl *decl) {
+    // If the declaration is generic, fail.
+    if (decl->isGenericContext())
+      return Type();
+
+    return decl->getDeclaredType();
+  }
+
   Type createNominalType(NominalTypeDecl *decl, Type parent) {
     // If the declaration is generic, fail.
-    if (decl->getGenericSignature())
+    if (decl->getGenericParams())
       return Type();
 
     // Validate the parent type.
@@ -142,10 +154,40 @@ public:
     return NominalType::get(decl, parent, Ctx);
   }
 
+  Type createBoundGenericType(NominalTypeDecl *decl, ArrayRef<Type> args) {
+    // If the declaration isn't generic, fail.
+    if (!decl->isGenericContext())
+      return Type();
+
+    // Build a SubstitutionMap.
+    auto *genericSig = decl->getGenericSignature();
+    auto genericParams = genericSig->getSubstitutableParams();
+    if (genericParams.size() != args.size())
+      return Type();
+
+    auto subMap = genericSig->getSubstitutionMap(
+        [&](SubstitutableType *t) -> Type {
+          for (unsigned i = 0, e = genericParams.size(); i < e; ++i) {
+            if (t->isEqual(genericParams[i]))
+              return args[i];
+          }
+          return Type();
+        },
+        // FIXME: Wrong module
+        LookUpConformanceInModule(decl->getParentModule()));
+
+    auto origType = decl->getDeclaredInterfaceType();
+
+    // FIXME: We're not checking that the type satisfies the generic
+    // requirements of the signature here.
+    auto substType = origType.subst(subMap);
+    return substType;
+  }
+
   Type createBoundGenericType(NominalTypeDecl *decl, ArrayRef<Type> args,
                               Type parent) {
     // If the declaration isn't generic, fail.
-    if (!decl->getGenericSignature())
+    if (!decl->getGenericParams())
       return Type();
 
     // Validate the parent type.
@@ -156,7 +198,8 @@ public:
     TypeReprList genericArgReprs(args);
     GenericIdentTypeRepr genericRepr(SourceLoc(), decl->getName(),
                                      genericArgReprs.getList(), SourceRange());
-    genericRepr.setValue(decl);
+    // FIXME
+    genericRepr.setValue(decl, nullptr);
 
     Type genericType;
 
@@ -179,7 +222,8 @@ public:
           : GenericArgs(type->getGenericArgs()),
             Ident(SourceLoc(), type->getDecl()->getName(),
                   GenericArgs.getList(), SourceRange()) {
-          Ident.setValue(type->getDecl());
+          // FIXME
+          Ident.setValue(type->getDecl(), nullptr);
         }
 
         // SmallVector::emplace_back will never need to call this because
@@ -209,9 +253,12 @@ public:
           auto nominal = p->castTo<NominalType>();
           simpleComponents.emplace_back(SourceLoc(),
                                         nominal->getDecl()->getName());
+          // FIXME
+          simpleComponents.back().setValue(nominal->getDecl(), nullptr);
           componentReprs.push_back(&simpleComponents.back());
         }
       }
+      componentReprs.push_back(&genericRepr);
 
       CompoundIdentTypeRepr compoundRepr(componentReprs);
       genericType = checkTypeRepr(&compoundRepr);
@@ -302,24 +349,31 @@ public:
 
   Type createProtocolType(StringRef mangledName,
                           StringRef moduleName,
-                          StringRef protocolName) {
+                          StringRef privateDiscriminator,
+                          StringRef name) {
     auto module = Ctx.getModuleByName(moduleName);
     if (!module) return Type();
 
-    Identifier name = Ctx.getIdentifier(protocolName);
-    auto decl = findNominalTypeDecl(module, name, Identifier(),
+    auto decl = findNominalTypeDecl(module,
+                                    Ctx.getIdentifier(name),
+                                    (privateDiscriminator.empty()
+                                     ? Identifier()
+                                     : Ctx.getIdentifier(privateDiscriminator)),
                                     Demangle::Node::Kind::Protocol);
     if (!decl) return Type();
 
     return decl->getDeclaredType();
   }
 
-  Type createProtocolCompositionType(ArrayRef<Type> protocols) {
-    for (auto protocol : protocols) {
-      if (!protocol->is<ProtocolType>())
+  Type createProtocolCompositionType(ArrayRef<Type> members,
+                                     bool hasExplicitAnyObject) {
+    for (auto member : members) {
+      if (!member->isExistentialType() &&
+          !member->getClassOrBoundGenericClass())
         return Type();
     }
-    return ProtocolCompositionType::get(Ctx, protocols);
+
+    return ProtocolCompositionType::get(Ctx, members, hasExplicitAnyObject);
   }
 
   Type createExistentialMetatypeType(Type instance) {
@@ -342,7 +396,7 @@ public:
     if (!base->isTypeParameter())
       return Type();
     // TODO: look up protocol?
-    return DependentMemberType::get(base, Ctx.getIdentifier(member), Ctx);
+    return DependentMemberType::get(base, Ctx.getIdentifier(member));
   }
 
   Type createUnownedStorageType(Type base) {
@@ -474,7 +528,7 @@ private:
     }
   };
 };
-}
+} // end anonymous namespace
 
 NominalTypeDecl *
 RemoteASTTypeBuilder::createNominalTypeDecl(const Demangle::NodePointer &node) {
@@ -665,11 +719,13 @@ public:
   virtual ~RemoteASTContextImpl() = default;
 
   virtual Result<Type>
-  getTypeForRemoteTypeMetadata(RemoteAddress metadata) = 0;
+  getTypeForRemoteTypeMetadata(RemoteAddress metadata, bool skipArtificial) = 0;
   virtual Result<MetadataKind>
   getKindForRemoteTypeMetadata(RemoteAddress metadata) = 0;
   virtual Result<NominalTypeDecl*>
   getDeclForRemoteNominalTypeDescriptor(RemoteAddress descriptor) = 0;
+  virtual Result<RemoteAddress>
+  getHeapMetadataForObject(RemoteAddress object) = 0;
 
   Result<uint64_t>
   getOffsetOfMember(Type type, RemoteAddress optMetadata, StringRef memberName){
@@ -699,6 +755,11 @@ protected:
     return getBuilder().getFailureAsResult<T>(Failure::Unknown);
   }
 
+  template <class T, class KindTy, class... ArgTys>
+  Result<T> fail(KindTy kind, ArgTys &&...args) {
+    return Result<T>::emplaceFailure(kind, std::forward<ArgTys>(args)...);
+  }
+
 private:
   virtual RemoteASTTypeBuilder &getBuilder() = 0;
   virtual MemoryReader &getReader() = 0;
@@ -714,11 +775,6 @@ private:
   IRGenContext *getIRGen() {
     if (!IRGen) IRGen = createIRGenContext();
     return IRGen.get();
-  }
-
-  template <class T, class KindTy, class... ArgTys>
-  Result<T> fail(KindTy kind, ArgTys &&...args) {
-    return Result<T>::emplaceFailure(kind, std::forward<ArgTys>(args)...);
   }
 
   Result<uint64_t>
@@ -970,8 +1026,10 @@ public:
                                ASTContext &ctx)
     : Reader(std::move(reader), ctx) {}
 
-  Result<Type> getTypeForRemoteTypeMetadata(RemoteAddress metadata) override {
-    if (auto result = Reader.readTypeFromMetadata(metadata.getAddressData()))
+  Result<Type> getTypeForRemoteTypeMetadata(RemoteAddress metadata,
+                                            bool skipArtificial) override {
+    if (auto result = Reader.readTypeFromMetadata(metadata.getAddressData(),
+                                                  skipArtificial))
       return result;
     return getFailure<Type>();
   }
@@ -1013,6 +1071,13 @@ public:
     return fail<uint64_t>(Failure::Unimplemented,
                           "look up field offset by name");
   }
+
+  Result<RemoteAddress>
+  getHeapMetadataForObject(RemoteAddress object) override {
+    auto result = Reader.readMetadataFromInstance(object.getAddressData());
+    if (result.first) return RemoteAddress(result.second);
+    return getFailure<RemoteAddress>();
+  }
 };
 
 } // end anonymous namespace
@@ -1045,8 +1110,9 @@ RemoteASTContext::~RemoteASTContext() {
 }
 
 Result<Type>
-RemoteASTContext::getTypeForRemoteTypeMetadata(RemoteAddress address) {
-  return asImpl(Impl)->getTypeForRemoteTypeMetadata(address);
+RemoteASTContext::getTypeForRemoteTypeMetadata(RemoteAddress address,
+                                               bool skipArtificial) {
+  return asImpl(Impl)->getTypeForRemoteTypeMetadata(address, skipArtificial);
 }
 
 Result<MetadataKind>
@@ -1063,4 +1129,9 @@ Result<uint64_t>
 RemoteASTContext::getOffsetOfMember(Type type, RemoteAddress optMetadata,
                                     StringRef memberName) {
   return asImpl(Impl)->getOffsetOfMember(type, optMetadata, memberName);
+}
+
+Result<remote::RemoteAddress>
+RemoteASTContext::getHeapMetadataForObject(remote::RemoteAddress address) {
+  return asImpl(Impl)->getHeapMetadataForObject(address);
 }

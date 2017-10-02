@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -18,14 +18,17 @@
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/ASTWalker.h"
 #include "swift/AST/Decl.h"
+#include "swift/AST/Expr.h"
 #include "swift/AST/Initializer.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/Pattern.h"
 #include "swift/AST/Stmt.h"
-#include "swift/Basic/Fallthrough.h"
+#include "swift/AST/TypeRepr.h"
 #include "swift/Basic/STLExtras.h"
+#include "llvm/Support/Compiler.h"
 #include <algorithm>
+
 using namespace swift;
 
 const ASTScope *ASTScope::getActiveContinuation() const {
@@ -37,6 +40,8 @@ const ASTScope *ASTScope::getActiveContinuation() const {
   case ContinuationKind::ActiveThenSourceFile:
     return continuation.getPointer();
   }
+
+  llvm_unreachable("Unhandled ContinuationKind in switch.");
 }
 
 const ASTScope *ASTScope::getHistoricalContinuation() const {
@@ -48,6 +53,8 @@ const ASTScope *ASTScope::getHistoricalContinuation() const {
   case ContinuationKind::ActiveThenSourceFile:
     return getSourceFileScope();
   }
+
+  llvm_unreachable("Unhandled ContinuationKind in switch.");
 }
 
 void ASTScope::addActiveContinuation(const ASTScope *newContinuation) const {
@@ -177,30 +184,13 @@ static bool hasAccessors(AbstractStorageDecl *asd) {
   case AbstractStorageDecl::StoredWithTrivialAccessors:
     return false;
   }
-}
 
-/// Determine whether this is a top-level code declaration that isn't just
-/// wrapping an #if.
-static bool isRealTopLevelCodeDecl(Decl *decl) {
-  auto topLevelCode = dyn_cast<TopLevelCodeDecl>(decl);
-  if (!topLevelCode) return false;
-
-  // Drop top-level statements containing just an IfConfigStmt.
-  // FIXME: The modeling of IfConfig is weird.
-  auto braceStmt = topLevelCode->getBody();
-  auto elements = braceStmt->getElements();
-  if (elements.size() == 1 &&
-      elements[0].is<Stmt *>() &&
-      isa<IfConfigStmt>(elements[0].get<Stmt *>()))
-    return false;
-
-  return true;
+  llvm_unreachable("Unhandled ContinuationKind in switch.");
 }
 
 void ASTScope::expand() const {
   assert(!isExpanded() && "Already expanded the children of this node");
   ASTContext &ctx = getASTContext();
-  SourceManager &sourceMgr = ctx.SourceMgr;
 
 #ifndef NDEBUG
   auto verificationError = [&]() -> llvm::raw_ostream& {
@@ -228,6 +218,7 @@ void ASTScope::expand() const {
 
 #ifndef NDEBUG
     // Check invariants in asserting builds.
+    SourceManager &sourceMgr = ctx.SourceMgr;
 
     // Check for containment of the child within the parent.
     if (!sourceMgr.rangeContains(getSourceRange(), child->getSourceRange())) {
@@ -304,7 +295,7 @@ void ASTScope::expand() const {
 
         // If the declaration is a top-level code declaration, turn the source
         // file into a continuation. We're done.
-        if (isRealTopLevelCodeDecl(decl)) {
+        if (isa<TopLevelCodeDecl>(decl)) {
           addActiveContinuation(this);
           break;
         }
@@ -567,30 +558,6 @@ void ASTScope::expand() const {
       addChild(bodyChild);
     break;
 
-  case ASTScopeKind::ForStmt:
-    // The for statement encloses the scope introduced by its initializers.
-    addChild(new (ctx) ASTScope(ASTScopeKind::ForStmtInitializer,
-                                this, forStmt));
-    break;
-
-  case ASTScopeKind::ForStmtInitializer:
-    // Add a child for the condition, if present.
-    if (auto cond = forStmt->getCond()) {
-      if (auto condChild = createIfNeeded(this, cond.get()))
-        addChild(condChild);
-    }
-
-    // Add a child for the increment, if present.
-    if (auto incr = forStmt->getIncrement()) {
-      if (auto incrChild = createIfNeeded(this, incr.get()))
-        addChild(incrChild);
-    }
-
-    // Add a child for the body.
-    if (auto bodyChild = createIfNeeded(this, forStmt->getBody()))
-      addChild(bodyChild);
-    break;
-
   case ASTScopeKind::Accessors: {
     // Add children for all of the explicitly-written accessors.
     SmallVector<ASTScope *, 4> accessors;
@@ -753,8 +720,6 @@ static bool parentDirectDescendedFromAbstractStorageDecl(
     case ASTScopeKind::CatchStmt:
     case ASTScopeKind::SwitchStmt:
     case ASTScopeKind::CaseStmt:
-    case ASTScopeKind::ForStmt:
-    case ASTScopeKind::ForStmtInitializer:
     case ASTScopeKind::Closure:
     case ASTScopeKind::TopLevelCode:
       // Not a direct descendant.
@@ -801,8 +766,6 @@ static bool parentDirectDescendedFromAbstractFunctionDecl(
     case ASTScopeKind::CatchStmt:
     case ASTScopeKind::SwitchStmt:
     case ASTScopeKind::CaseStmt:
-    case ASTScopeKind::ForStmt:
-    case ASTScopeKind::ForStmtInitializer:
     case ASTScopeKind::Closure:
     case ASTScopeKind::TopLevelCode:
       // Not a direct descendant.
@@ -848,8 +811,6 @@ static bool parentDirectDescendedFromTypeDecl(const ASTScope *parent,
     case ASTScopeKind::CatchStmt:
     case ASTScopeKind::SwitchStmt:
     case ASTScopeKind::CaseStmt:
-    case ASTScopeKind::ForStmt:
-    case ASTScopeKind::ForStmtInitializer:
     case ASTScopeKind::Closure:
     case ASTScopeKind::TopLevelCode:
       // Not a direct descendant.
@@ -865,14 +826,11 @@ ASTScope *ASTScope::createIfNeeded(const ASTScope *parent, Decl *decl) {
   if (decl->isImplicit()) return nullptr;
 
   // Accessors are always nested within their abstract storage declaration.
-  bool isAccessor = false;
   if (auto func = dyn_cast<FuncDecl>(decl)) {
-    if (func->isAccessor()) {
-      isAccessor = true;
-      if (!parentDirectDescendedFromAbstractStorageDecl(
-             parent, func->getAccessorStorageDecl()))
-        return nullptr;
-    }
+    if (func->isAccessor() &&
+        !parentDirectDescendedFromAbstractStorageDecl(
+            parent, func->getAccessorStorageDecl()))
+      return nullptr;
   }
 
   ASTContext &ctx = decl->getASTContext();
@@ -923,6 +881,7 @@ ASTScope *ASTScope::createIfNeeded(const ASTScope *parent, Decl *decl) {
   case DeclKind::Param:
   case DeclKind::EnumElement:
   case DeclKind::IfConfig:
+  case DeclKind::MissingMember:
     // These declarations do not introduce scopes.
     return nullptr;
 
@@ -943,12 +902,11 @@ ASTScope *ASTScope::createIfNeeded(const ASTScope *parent, Decl *decl) {
   }
 
   case DeclKind::TopLevelCode:
-    if (!isRealTopLevelCodeDecl(decl)) return nullptr;
     return new (ctx) ASTScope(parent, cast<TopLevelCodeDecl>(decl));
 
   case DeclKind::Protocol:
     cast<ProtocolDecl>(decl)->createGenericParamsIfMissing();
-    SWIFT_FALLTHROUGH;
+    LLVM_FALLTHROUGH;
 
   case DeclKind::Class:
   case DeclKind::Enum:
@@ -1077,6 +1035,8 @@ ASTScope *ASTScope::createIfNeeded(const ASTScope *parent, Decl *decl) {
     return nullptr;
   }
   }
+
+  llvm_unreachable("Unhandled DeclKind in switch.");
 }
 
 ASTScope *ASTScope::createIfNeeded(const ASTScope *parent, Stmt *stmt) {
@@ -1122,10 +1082,6 @@ ASTScope *ASTScope::createIfNeeded(const ASTScope *parent, Stmt *stmt) {
     return new (ctx) ASTScope(ASTScopeKind::ForEachStmt, parent,
                               cast<ForEachStmt>(stmt));
 
-  case StmtKind::For:
-    return new (ctx) ASTScope(ASTScopeKind::ForStmt, parent,
-                              cast<ForStmt>(stmt));
-
   case StmtKind::Do:
     return createIfNeeded(parent, cast<DoStmt>(stmt)->getBody());
 
@@ -1144,12 +1100,13 @@ ASTScope *ASTScope::createIfNeeded(const ASTScope *parent, Stmt *stmt) {
   case StmtKind::Break:
   case StmtKind::Continue:
   case StmtKind::Fallthrough:
-  case StmtKind::IfConfig:
   case StmtKind::Fail:
   case StmtKind::Throw:
     // Nothing to do for these statements.
     return nullptr;
   }
+
+  llvm_unreachable("Unhandled StmtKind in switch.");
 }
 
 /// Find all of the (non-nested) closures referenced within this expression.
@@ -1164,7 +1121,7 @@ static SmallVector<ClosureExpr *, 4> findClosures(Expr *expr) {
   public:
     ClosureFinder(SmallVectorImpl<ClosureExpr *> &closures) : closures(closures) { }
 
-    virtual std::pair<bool, Expr *> walkToExprPre(Expr *E) override {
+    std::pair<bool, Expr *> walkToExprPre(Expr *E) override {
       if (auto closure = dyn_cast<ClosureExpr>(E)) {
         closures.push_back(closure);
         return { false, E };
@@ -1173,21 +1130,21 @@ static SmallVector<ClosureExpr *, 4> findClosures(Expr *expr) {
       return { true, E };
     }
 
-    virtual std::pair<bool, Stmt *> walkToStmtPre(Stmt *S) override {
+    std::pair<bool, Stmt *> walkToStmtPre(Stmt *S) override {
       return { false, S };
     }
 
-    virtual std::pair<bool, Pattern*> walkToPatternPre(Pattern *P) override {
+    std::pair<bool, Pattern*> walkToPatternPre(Pattern *P) override {
       return { false, P };
     }
 
-    virtual bool walkToDeclPre(Decl *D) override { return false; }
+    bool walkToDeclPre(Decl *D) override { return false; }
 
-    virtual bool walkToTypeLocPre(TypeLoc &TL) override { return false; }
+    bool walkToTypeLocPre(TypeLoc &TL) override { return false; }
 
-    virtual bool walkToTypeReprPre(TypeRepr *T) override { return false; }
+    bool walkToTypeReprPre(TypeRepr *T) override { return false; }
 
-    virtual bool walkToParameterListPre(ParameterList *PL) override {
+    bool walkToParameterListPre(ParameterList *PL) override {
       return false;
     }
   };
@@ -1244,8 +1201,6 @@ bool ASTScope::canStealContinuation() const {
   case ASTScopeKind::CatchStmt:
   case ASTScopeKind::SwitchStmt:
   case ASTScopeKind::CaseStmt:
-  case ASTScopeKind::ForStmt:
-  case ASTScopeKind::ForStmtInitializer:
   case ASTScopeKind::Closure:
   case ASTScopeKind::TypeDecl:
   case ASTScopeKind::AbstractFunctionDecl:
@@ -1275,6 +1230,8 @@ bool ASTScope::canStealContinuation() const {
     // Guard conditions steal continuations.
     return conditionalClause.isGuardContinuation;
   }
+
+  llvm_unreachable("Unhandled ASTScopeKind in switch.");
 }
 
 void ASTScope::enumerateContinuationScopes(
@@ -1373,8 +1330,6 @@ ASTContext &ASTScope::getASTContext() const {
   case ASTScopeKind::CatchStmt:
   case ASTScopeKind::SwitchStmt:
   case ASTScopeKind::CaseStmt:
-  case ASTScopeKind::ForStmt:
-  case ASTScopeKind::ForStmtInitializer:
   case ASTScopeKind::Closure:
     return getParent()->getASTContext();
 
@@ -1384,6 +1339,8 @@ ASTContext &ASTScope::getASTContext() const {
   case ASTScopeKind::TopLevelCode:
     return static_cast<Decl *>(topLevelCode)->getASTContext();
   }
+
+  llvm_unreachable("Unhandled ASTScopeKind in switch.");
 }
 
 const ASTScope *ASTScope::getSourceFileScope() const {
@@ -1420,9 +1377,14 @@ SourceRange ASTScope::getSourceRangeImpl() const {
     return typeDecl->getSourceRange();
 
   case ASTScopeKind::ExtensionGenericParams: {
-    // The generic parameters of an extension are available from the trailing
+    // The generic parameters of an extension are available from the ':' of
+    // the inheritance clause (if available), or else that from the
     // 'where' (if present) or from the start of the body.
+    // FIXME: Approximating the ':' with the start of the first inherited entry.
     SourceLoc startLoc;
+    if (!extension->getInherited().empty() &&
+        extension->getInherited().front().getSourceRange().Start.isValid())
+      startLoc = extension->getInherited().front().getSourceRange().Start;
     if (auto trailingWhere = extension->getTrailingWhereClause())
       startLoc = trailingWhere->getWhereLoc();
     else
@@ -1639,12 +1601,6 @@ SourceRange ASTScope::getSourceRangeImpl() const {
     // Otherwise, it covers the body.
     return caseStmt->getBody()->getSourceRange();
 
-  case ASTScopeKind::ForStmt:
-    return forStmt->getSourceRange();
-
-  case ASTScopeKind::ForStmtInitializer:
-    return SourceRange(forStmt->getFirstSemicolonLoc(), forStmt->getEndLoc());
-
   case ASTScopeKind::Accessors:
     return abstractStorageDecl->getBracesRange();
 
@@ -1657,6 +1613,8 @@ SourceRange ASTScope::getSourceRangeImpl() const {
   case ASTScopeKind::TopLevelCode:
     return topLevelCode->getSourceRange();
   }
+
+  llvm_unreachable("Unhandled ASTScopeKind in switch.");
 }
 
 /// Find the innermost enclosing scope that contains this source location.
@@ -1762,11 +1720,11 @@ DeclContext *ASTScope::getDeclContext() const {
   case ASTScopeKind::CatchStmt:
   case ASTScopeKind::SwitchStmt:
   case ASTScopeKind::CaseStmt:
-  case ASTScopeKind::ForStmt:
-  case ASTScopeKind::ForStmtInitializer:
   case ASTScopeKind::AbstractFunctionBody:
     return nullptr;
   }
+
+  llvm_unreachable("Unhandled ASTScopeKind in switch.");
 }
 
 DeclContext *ASTScope::getInnermostEnclosingDeclContext() const {
@@ -1801,13 +1759,18 @@ SmallVector<ValueDecl *, 4> ASTScope::getLocalBindings() const {
   case ASTScopeKind::ForEachStmt:
   case ASTScopeKind::DoCatchStmt:
   case ASTScopeKind::SwitchStmt:
-  case ASTScopeKind::ForStmt:
   case ASTScopeKind::Accessors:
   case ASTScopeKind::TopLevelCode:
     // No local declarations.
     break;
 
-  case ASTScopeKind::ExtensionGenericParams:
+  case ASTScopeKind::ExtensionGenericParams: {
+    // If the source range containing the extension parameters is empty,
+    // do nothing.
+    SourceRange range = getSourceRangeImpl();
+    if (range.Start == range.End)
+      break;
+
     // Bind this extension, if we haven't done so already.
     if (!extension->getExtendedType())
       if (auto resolver = extension->getASTContext().getLazyResolver())
@@ -1821,6 +1784,7 @@ SmallVector<ValueDecl *, 4> ASTScope::getLocalBindings() const {
         result.push_back(param);
     }
     break;
+  }
 
   case ASTScopeKind::GenericParams:
     result.push_back(genericParams.params->getParams()[genericParams.index]);
@@ -1865,32 +1829,17 @@ SmallVector<ValueDecl *, 4> ASTScope::getLocalBindings() const {
       handlePattern(item.getPattern());
     break;
 
-  case ASTScopeKind::ForStmtInitializer:
-    for (auto decl : forStmt->getInitializerVarDecls()) {
-      if (auto value = dyn_cast<ValueDecl>(decl))
-        result.push_back(value);
-    }
-    break;
-
-  case ASTScopeKind::PatternInitializer:
+  case ASTScopeKind::PatternInitializer: {
     // 'self' is available within the pattern initializer of a 'lazy' variable.
-    if (auto singleVar = patternBinding.decl->getSingleVar()) {
-      if (singleVar->getAttrs().hasAttribute<LazyAttr>() &&
-          singleVar->getDeclContext()->isTypeContext()) {
-        // If there is no getter (yet), add them.
-        if (!singleVar->getGetter()) {
-          ASTContext &ctx = singleVar->getASTContext();
-          if (auto resolver = ctx.getLazyResolver())
-            resolver->introduceLazyVarAccessors(singleVar);
-        }
-
-        // Add the getter's 'self'.
-        if (auto getter = singleVar->getGetter())
-          if (auto self = getter->getImplicitSelfDecl())
-            result.push_back(self);
-      }
+    auto *initContext = cast_or_null<PatternBindingInitializer>(
+      patternBinding.decl->getPatternList()[0].getInitContext());
+    if (initContext) {
+      if (auto *selfParam = initContext->getImplicitSelfDecl())
+        result.push_back(selfParam);
     }
+
     break;
+  }
 
   case ASTScopeKind::Closure:
     // Note: Parameters all at once is different from functions, but it's not
@@ -2125,18 +2074,6 @@ void ASTScope::print(llvm::raw_ostream &out, unsigned level,
   case ASTScopeKind::CaseStmt:
     printScopeKind("CaseStmt");
     printAddress(caseStmt);
-    printRange();
-    break;
-
-  case ASTScopeKind::ForStmt:
-    printScopeKind("ForStmt");
-    printAddress(forStmt);
-    printRange();
-    break;
-
-  case ASTScopeKind::ForStmtInitializer:
-    printScopeKind("ForStmtInitializer");
-    printAddress(forStmt);
     printRange();
     break;
 

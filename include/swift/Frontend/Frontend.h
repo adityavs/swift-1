@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -18,24 +18,26 @@
 #ifndef SWIFT_FRONTEND_H
 #define SWIFT_FRONTEND_H
 
-#include "swift/Basic/DiagnosticConsumer.h"
-#include "swift/Basic/DiagnosticOptions.h"
-#include "swift/Basic/LangOptions.h"
-#include "swift/Basic/SourceManager.h"
+#include "swift/AST/DiagnosticConsumer.h"
 #include "swift/AST/DiagnosticEngine.h"
 #include "swift/AST/IRGenOptions.h"
 #include "swift/AST/LinkLibrary.h"
 #include "swift/AST/Module.h"
-#include "swift/AST/SearchPathOptions.h"
 #include "swift/AST/SILOptions.h"
-#include "swift/Parse/CodeCompletionCallbacks.h"
-#include "swift/Parse/Parser.h"
+#include "swift/AST/SearchPathOptions.h"
+#include "swift/Basic/DiagnosticOptions.h"
+#include "swift/Basic/LangOptions.h"
+#include "swift/Basic/SourceManager.h"
 #include "swift/ClangImporter/ClangImporter.h"
 #include "swift/ClangImporter/ClangImporterOptions.h"
 #include "swift/Frontend/FrontendOptions.h"
+#include "swift/Migrator/MigratorOptions.h"
+#include "swift/Parse/CodeCompletionCallbacks.h"
+#include "swift/Parse/Parser.h"
+#include "swift/SIL/SILModule.h"
 #include "swift/Sema/SourceLoader.h"
 #include "swift/Serialization/Validation.h"
-#include "swift/SIL/SILModule.h"
+#include "swift/Subsystems.h"
 #include "llvm/ADT/IntrusiveRefCntPtr.h"
 #include "llvm/Option/ArgList.h"
 #include "llvm/Support/Host.h"
@@ -62,6 +64,7 @@ class CompilerInvocation {
   ClangImporterOptions ClangImporterOpts;
   SearchPathOptions SearchPathOpts;
   DiagnosticOptions DiagnosticOpts;
+  MigratorOptions MigratorOpts;
   SILOptions SILOpts;
   IRGenOptions IRGenOpts;
 
@@ -133,11 +136,12 @@ public:
     return SearchPathOpts.ImportSearchPaths;
   }
 
-  void setFrameworkSearchPaths(const std::vector<std::string> &Paths) {
+  void setFrameworkSearchPaths(
+             const std::vector<SearchPathOptions::FrameworkSearchPath> &Paths) {
     SearchPathOpts.FrameworkSearchPaths = Paths;
   }
 
-  ArrayRef<std::string> getFrameworkSearchPaths() const {
+  ArrayRef<SearchPathOptions::FrameworkSearchPath> getFrameworkSearchPaths() const {
     return SearchPathOpts.FrameworkSearchPaths;
   }
 
@@ -199,6 +203,10 @@ public:
   DiagnosticOptions &getDiagnosticOptions() { return DiagnosticOpts; }
   const DiagnosticOptions &getDiagnosticOptions() const {
     return DiagnosticOpts;
+  }
+
+  const MigratorOptions &getMigratorOptions() const {
+    return MigratorOpts;
   }
 
   SILOptions &getSILOptions() { return SILOpts; }
@@ -263,6 +271,9 @@ public:
     assert(Buf);
     CodeCompletionBuffer = Buf;
     CodeCompletionOffset = Offset;
+    // We don't need typo-correction for code-completion.
+    // FIXME: This isn't really true, but is a performance issue.
+    LangOpts.TypoCorrectionLimit = 0;
   }
 
   std::pair<llvm::MemoryBuffer *, unsigned> getCodeCompletionPoint() const {
@@ -289,6 +300,21 @@ public:
   bool isDelayedFunctionBodyParsing() const {
     return FrontendOpts.DelayedFunctionBodyParsing;
   }
+
+  /// Retrieve a module hash string that is suitable for uniquely
+  /// identifying the conditions under which the module was built, for use
+  /// in generating a cached PCH file for the bridging header.
+  std::string getPCHHash() const;
+
+  SourceFile::ImplicitModuleImportKind getImplicitModuleImportKind() {
+    if (getInputKind() == InputFileKind::IFK_SIL) {
+      return SourceFile::ImplicitModuleImportKind::None;
+    }
+    if (getParseStdlib()) {
+      return SourceFile::ImplicitModuleImportKind::Builtin;
+    }
+    return SourceFile::ImplicitModuleImportKind::Stdlib;
+  }
 };
 
 /// A class which manages the state and execution of the compiler.
@@ -309,7 +335,7 @@ class CompilerInstance {
   DependencyTracker *DepTracker = nullptr;
   ReferencedNameTracker *NameTracker = nullptr;
 
-  Module *MainModule = nullptr;
+  ModuleDecl *MainModule = nullptr;
   SerializedModuleLoader *SML = nullptr;
 
   /// Contains buffer IDs for input source code files.
@@ -326,11 +352,14 @@ class CompilerInstance {
 
   enum : unsigned { NO_SUCH_BUFFER = ~0U };
   unsigned MainBufferID = NO_SUCH_BUFFER;
+
+  /// PrimaryBufferID corresponds to PrimaryInput.
   unsigned PrimaryBufferID = NO_SUCH_BUFFER;
+  bool isWholeModuleCompilation() { return PrimaryBufferID == NO_SUCH_BUFFER; }
 
   SourceFile *PrimarySourceFile = nullptr;
 
-  void createSILModule(bool WholeModule = false);
+  void createSILModule();
   void setPrimarySourceFile(SourceFile *SF);
 
 public:
@@ -385,7 +414,7 @@ public:
     return static_cast<bool>(TheSILModule);
   }
 
-  Module *getMainModule();
+  ModuleDecl *getMainModule();
 
   SerializedModuleLoader *getSerializedModuleLoader() const { return SML; }
 
@@ -411,7 +440,62 @@ public:
 
   /// Parses the input file but does no type-checking or module imports.
   /// Note that this only supports parsing an invocation with a single file.
-  void performParseOnly();
+  ///
+  ///
+  void performParseOnly(bool EvaluateConditionals = false);
+
+  /// Frees up the ASTContext and SILModule objects that this instance is
+  /// holding on.
+  void freeContextAndSIL();
+
+private:
+  /// Load stdlib & return true if should continue, i.e. no error
+  bool loadStdlib();
+  ModuleDecl *importUnderlyingModule();
+  ModuleDecl *importBridgingHeader();
+
+  void
+  getImplicitlyImportedModules(SmallVectorImpl<ModuleDecl *> &importModules);
+
+public: // for static functions in Frontend.cpp
+  struct ImplicitImports {
+    SourceFile::ImplicitModuleImportKind kind;
+    ModuleDecl *objCModuleUnderlyingMixedFramework;
+    ModuleDecl *headerModule;
+    SmallVector<ModuleDecl *, 4> modules;
+
+    explicit ImplicitImports(CompilerInstance &compiler);
+  };
+
+private:
+  void createREPLFile(const ImplicitImports &implicitImports) const;
+  std::unique_ptr<DelayedParsingCallbacks> computeDelayedParsingCallback();
+
+  void addMainFileToModule(const ImplicitImports &implicitImports);
+
+  void parseAndCheckTypes(const ImplicitImports &implicitImports);
+
+  void parseLibraryFile(unsigned BufferID,
+                        const ImplicitImports &implicitImports,
+                        PersistentParserState &PersistentState,
+                        DelayedParsingCallbacks *DelayedParseCB);
+
+  /// Return true if had load error
+  bool
+  parsePartialModulesAndLibraryFiles(const ImplicitImports &implicitImports,
+                                     PersistentParserState &PersistentState,
+                                     DelayedParsingCallbacks *DelayedParseCB);
+
+  OptionSet<TypeCheckingFlags> computeTypeCheckingOptions();
+
+  void forEachFileToTypeCheck(llvm::function_ref<void(SourceFile &)> fn);
+
+  void parseAndTypeCheckMainFile(PersistentParserState &PersistentState,
+                                 DelayedParsingCallbacks *DelayedParseCB,
+                                 OptionSet<TypeCheckingFlags> TypeCheckOptions);
+  void performTypeCheckingAndDelayedParsing();
+
+  void finishTypeChecking(OptionSet<TypeCheckingFlags> TypeCheckOptions);
 };
 
 } // namespace swift

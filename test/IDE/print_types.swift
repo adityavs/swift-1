@@ -1,5 +1,5 @@
 // This file should not have any syntax or type checker errors.
-// RUN: %target-parse-verify-swift
+// RUN: %target-typecheck-verify-swift
 
 // RUN: %target-swift-ide-test -print-types -source-filename %s -fully-qualified-types=false | %FileCheck %s -strict-whitespace
 // RUN: %target-swift-ide-test -print-types -source-filename %s -fully-qualified-types=true | %FileCheck %s -check-prefix=FULL -strict-whitespace
@@ -57,14 +57,14 @@ func testVariableTypes(_ param: Int, param2: inout Double) {
   _ = typealias1 ; typealias1 = 1
 
   var optional1 = Optional<Int>.none
-// CHECK: VarDecl '''optional1''' Optional<Int>{{$}}
-// FULL:  VarDecl '''optional1''' Swift.Optional<Swift.Int>{{$}}
+// CHECK: VarDecl '''optional1''' Int?{{$}}
+// FULL:  VarDecl '''optional1''' Swift.Int?{{$}}
   _ = optional1 ; optional1 = nil
 
   var optional2 = Optional<[Int]>.none
   _ = optional2 ; optional2 = nil
-// CHECK: VarDecl '''optional2''' Optional<[Int]>{{$}}
-// FULL:  VarDecl '''optional2''' Swift.Optional<[Swift.Int]>{{$}}
+// CHECK: VarDecl '''optional2''' [Int]?{{$}}
+// FULL:  VarDecl '''optional2''' [Swift.Int]?{{$}}
 }
 
 func testFuncType1() {}
@@ -110,8 +110,8 @@ protocol QuxProtocol { associatedtype Qux }
 struct GenericStruct<A, B : FooProtocol> {}
 
 func testInGenericFunc1<A, B : FooProtocol, C : FooProtocol & BarProtocol>(_ a: A, b: B, c: C) {
-// CHECK: FuncDecl '''testInGenericFunc1''' <A, B : FooProtocol, C : FooProtocol & BarProtocol> (A, b: B, c: C) -> (){{$}}
-// FULL:  FuncDecl '''testInGenericFunc1''' <A, B : FooProtocol, C : FooProtocol & BarProtocol> (A, b: B, c: C) -> (){{$}}
+// CHECK: FuncDecl '''testInGenericFunc1''' <A, B, C where B : FooProtocol, C : BarProtocol, C : FooProtocol> (A, b: B, c: C) -> (){{$}}
+// FULL:  FuncDecl '''testInGenericFunc1''' <A, B, C where B : FooProtocol, C : BarProtocol, C : FooProtocol> (A, b: B, c: C) -> (){{$}}
 
   var a1 = a
   _ = a1; a1 = a
@@ -134,7 +134,7 @@ func testInGenericFunc1<A, B : FooProtocol, C : FooProtocol & BarProtocol>(_ a: 
 // FULL:          ConstructorRefCallExpr:[[@LINE-7]] '''GenericStruct<A, B>''' () -> swift_ide_test.GenericStruct<A, B>
 }
 
-func testInGenericFunc2<T : QuxProtocol, U : QuxProtocol>() where T.Qux == U.Qux {}
-// CHECK: FuncDecl '''testInGenericFunc2''' <T : QuxProtocol, U : QuxProtocol where T.Qux == U.Qux> () -> (){{$}}
-// FULL:  FuncDecl '''testInGenericFunc2''' <T : QuxProtocol, U : QuxProtocol where T.Qux == U.Qux> () -> (){{$}}
+func testInGenericFunc2<T : QuxProtocol, U : QuxProtocol>(_: T, _: U) where T.Qux == U.Qux {}
+// CHECK: FuncDecl '''testInGenericFunc2''' <T, U where T : QuxProtocol, U : QuxProtocol, T.Qux == U.Qux> (T, U) -> (){{$}}
+// FULL:  FuncDecl '''testInGenericFunc2''' <T, U where T : QuxProtocol, U : QuxProtocol, T.Qux == U.Qux> (T, U) -> (){{$}}
 

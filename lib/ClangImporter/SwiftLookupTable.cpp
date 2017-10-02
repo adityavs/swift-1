@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -14,12 +14,16 @@
 // modules.
 //
 //===----------------------------------------------------------------------===//
+#include "ImporterImpl.h"
 #include "SwiftLookupTable.h"
+#include "swift/AST/DiagnosticEngine.h"
+#include "swift/AST/DiagnosticsClangImporter.h"
 #include "swift/Basic/STLExtras.h"
 #include "swift/Basic/Version.h"
 #include "clang/AST/DeclObjC.h"
 #include "clang/Lex/MacroInfo.h"
 #include "clang/Lex/Preprocessor.h"
+#include "clang/Sema/Sema.h"
 #include "clang/Serialization/ASTBitCodes.h"
 #include "clang/Serialization/ASTReader.h"
 #include "clang/Serialization/ASTWriter.h"
@@ -32,6 +36,7 @@
 #include "llvm/Support/OnDiskHashTable.h"
 
 using namespace swift;
+using namespace importer;
 using namespace llvm::support;
 
 /// Determine whether the new declarations matches an existing declaration.
@@ -44,74 +49,101 @@ static bool matchesExistingDecl(clang::Decl *decl, clang::Decl *existingDecl) {
   return false;
 }
 
-namespace {
-enum class MacroConflictAction {
-  Discard,
-  Replace,
-  AddAsAlternative
+namespace swift {
+/// Module file extension writer for the Swift lookup tables.
+class SwiftLookupTableWriter : public clang::ModuleFileExtensionWriter {
+  clang::ASTWriter &Writer;
+
+  ASTContext &swiftCtx;
+  const PlatformAvailability &availability;
+  const bool inferImportAsMember;
+
+public:
+  SwiftLookupTableWriter(clang::ModuleFileExtension *extension,
+                         clang::ASTWriter &writer, ASTContext &ctx,
+                         const PlatformAvailability &avail, bool inferIAM)
+      : ModuleFileExtensionWriter(extension), Writer(writer), swiftCtx(ctx),
+        availability(avail), inferImportAsMember(inferIAM) {}
+
+  void writeExtensionContents(clang::Sema &sema,
+                              llvm::BitstreamWriter &stream) override;
+
+  void populateTable(SwiftLookupTable &table, NameImporter &);
 };
-}
 
-/// Based on the Clang module structure, decides what to do when a new
-/// definition of an existing macro is seen: discard it, have it replace the
-/// old one, or add it as an alternative.
-///
-/// Specifically, if the innermost explicit submodule containing \p newMacro
-/// contains the innermost explicit submodule containing \p existingMacro,
-/// \p newMacro should replace \p existingMacro; if they're the same module,
-/// \p existingMacro should stay in place. Otherwise, they don't share an
-/// explicit module, and should be considered alternatives.
-///
-/// Note that the above assumes that macro definitions are processed in reverse
-/// order, i.e. the first definition seen is the last in a translation unit.
-///
-/// If we're not currently building a module, then the "latest" macro wins,
-/// which (by the same assumption) should be the existing macro.
-static MacroConflictAction
-considerReplacingExistingMacro(const clang::MacroInfo *newMacro,
-                               const clang::MacroInfo *existingMacro,
-                               const clang::Preprocessor *PP) {
-  assert(PP);
-  assert(newMacro);
-  assert(existingMacro);
-  assert(newMacro->getOwningModuleID() == 0);
-  assert(existingMacro->getOwningModuleID() == 0);
+/// Module file extension reader for the Swift lookup tables.
+class SwiftLookupTableReader : public clang::ModuleFileExtensionReader {
+  clang::ASTReader &Reader;
+  clang::serialization::ModuleFile &ModuleFile;
+  std::function<void()> OnRemove;
 
-  if (PP->getLangOpts().CurrentModule.empty())
-    return MacroConflictAction::Discard;
+  void *SerializedTable;
+  ArrayRef<clang::serialization::DeclID> Categories;
+  void *GlobalsAsMembersTable;
 
-  clang::ModuleMap &moduleInfo = PP->getHeaderSearchInfo().getModuleMap();
-  const clang::SourceManager &sourceMgr = PP->getSourceManager();
+  SwiftLookupTableReader(clang::ModuleFileExtension *extension,
+                         clang::ASTReader &reader,
+                         clang::serialization::ModuleFile &moduleFile,
+                         std::function<void()> onRemove, void *serializedTable,
+                         ArrayRef<clang::serialization::DeclID> categories,
+                         void *globalsAsMembersTable)
+      : ModuleFileExtensionReader(extension), Reader(reader),
+        ModuleFile(moduleFile), OnRemove(onRemove),
+        SerializedTable(serializedTable), Categories(categories),
+        GlobalsAsMembersTable(globalsAsMembersTable) {}
 
-  auto findContainingExplicitModule =
-      [&moduleInfo, &sourceMgr](const clang::MacroInfo *macro)
-        -> const clang::Module * {
+public:
+  /// Create a new lookup table reader for the given AST reader and stream
+  /// position.
+  static std::unique_ptr<SwiftLookupTableReader>
+  create(clang::ModuleFileExtension *extension, clang::ASTReader &reader,
+         clang::serialization::ModuleFile &moduleFile,
+         std::function<void()> onRemove, const llvm::BitstreamCursor &stream);
 
-    clang::SourceLocation definitionLoc = macro->getDefinitionLoc();
-    assert(definitionLoc.isValid() &&
-           "implicitly-defined macros shouldn't show up in a module's lookup");
-    clang::FullSourceLoc fullLoc(definitionLoc, sourceMgr);
+  ~SwiftLookupTableReader() override;
 
-    const clang::Module *module = moduleInfo.inferModuleFromLocation(fullLoc);
-    assert(module && "we are building a module; everything should be modular");
+  /// Retrieve the AST reader associated with this lookup table reader.
+  clang::ASTReader &getASTReader() const { return Reader; }
 
-    while (module->isSubModule()) {
-      if (module->IsExplicit)
-        break;
-      module = module->Parent;
-    }
-    return module;
-  };
+  /// Retrieve the module file associated with this lookup table reader.
+  clang::serialization::ModuleFile &getModuleFile() { return ModuleFile; }
 
-  const clang::Module *newModule = findContainingExplicitModule(newMacro);
-  const clang::Module *existingModule =
-      findContainingExplicitModule(existingMacro);
+  /// Retrieve the set of base names that are stored in the on-disk hash table.
+  SmallVector<SerializedSwiftName, 4> getBaseNames();
 
-  if (existingModule == newModule)
-    return MacroConflictAction::Discard;
-  if (existingModule->isSubModuleOf(newModule))
-    return MacroConflictAction::Replace;
-  return MacroConflictAction::AddAsAlternative;
+  /// Retrieve the set of entries associated with the given base name.
+  ///
+  /// \returns true if we found anything, false otherwise.
+  bool lookup(SerializedSwiftName baseName,
+              SmallVectorImpl<SwiftLookupTable::FullTableEntry> &entries);
+
+  /// Retrieve the declaration IDs of the categories.
+  ArrayRef<clang::serialization::DeclID> categories() const {
+    return Categories;
+  }
+
+  /// Retrieve the set of contexts that have globals-as-members
+  /// injected into them.
+  SmallVector<SwiftLookupTable::StoredContext, 4> getGlobalsAsMembersContexts();
+
+  /// Retrieve the set of global declarations that are going to be
+  /// imported as members into the given context.
+  ///
+  /// \returns true if we found anything, false otherwise.
+  bool lookupGlobalsAsMembers(SwiftLookupTable::StoredContext context,
+                              SmallVectorImpl<uint64_t> &entries);
+};
+} // namespace swift
+
+DeclBaseName SerializedSwiftName::toDeclBaseName(ASTContext &Context) const {
+  switch (Kind) {
+  case DeclBaseName::Kind::Normal:
+    return Context.getIdentifier(Name);
+  case DeclBaseName::Kind::Subscript:
+    return DeclBaseName::createSubscript();
+  case DeclBaseName::Kind::Destructor:
+    return DeclBaseName::createDestructor();
+  }
 }
 
 bool SwiftLookupTable::contextRequiresName(ContextKind kind) {
@@ -125,6 +157,8 @@ bool SwiftLookupTable::contextRequiresName(ContextKind kind) {
   case ContextKind::TranslationUnit:
     return false;
   }
+
+  llvm_unreachable("Invalid ContextKind.");
 }
 
 /// Try to translate the given Clang declaration into a context.
@@ -204,15 +238,17 @@ SwiftLookupTable::translateContext(EffectiveClangContext context) {
 
     return None;
   }
+
+  llvm_unreachable("Invalid EffectiveClangContext.");
 }
 
 /// Lookup an unresolved context name and resolve it to a Clang
 /// declaration context or typedef name.
 clang::NamedDecl *SwiftLookupTable::resolveContext(StringRef unresolvedName) {
   // Look for a context with the given Swift name.
-  for (auto entry : lookup(unresolvedName, 
-                           std::make_pair(ContextKind::TranslationUnit,
-                                          StringRef()))) {
+  for (auto entry :
+       lookup(SerializedSwiftName(unresolvedName),
+              std::make_pair(ContextKind::TranslationUnit, StringRef()))) {
     if (auto decl = entry.dyn_cast<clang::NamedDecl *>()) {
       if (isa<clang::TagDecl>(decl) ||
           isa<clang::ObjCInterfaceDecl>(decl) ||
@@ -227,7 +263,8 @@ clang::NamedDecl *SwiftLookupTable::resolveContext(StringRef unresolvedName) {
 }
 
 void SwiftLookupTable::addCategory(clang::ObjCCategoryDecl *category) {
-  assert(!Reader && "Cannot modify a lookup table stored on disk");
+  // Force deserialization to occur before appending.
+  (void) categories();
 
   // Add the category.
   Categories.push_back(category);
@@ -322,9 +359,13 @@ static bool isGlobalAsMember(SwiftLookupTable::SingleEntry entry,
   // We have a declaration.
   auto decl = entry.get<clang::NamedDecl *>();
 
-  // Enumerators are always stored within the enumeration, despite
-  // having the translation unit as their redeclaration context.
-  if (isa<clang::EnumConstantDecl>(decl)) return false;
+  // Enumerators have the translation unit as their redeclaration context,
+  // but members of anonymous enums are still allowed to be in the
+  // global-as-member category.
+  if (isa<clang::EnumConstantDecl>(decl)) {
+    const auto *theEnum = cast<clang::EnumDecl>(decl->getDeclContext());
+    return !theEnum->hasNameForLinkage();
+  }
 
   // If the redeclaration context is namespace-scope, then we're
   // mapping as a member.
@@ -332,47 +373,73 @@ static bool isGlobalAsMember(SwiftLookupTable::SingleEntry entry,
 }
 
 bool SwiftLookupTable::addLocalEntry(SingleEntry newEntry,
-                                     SmallVectorImpl<uintptr_t> &entries,
-                                     const clang::Preprocessor *PP) {
+                                     SmallVectorImpl<uint64_t> &entries) {
   // Check whether this entry matches any existing entry.
   auto decl = newEntry.dyn_cast<clang::NamedDecl *>();
   auto macro = newEntry.dyn_cast<clang::MacroInfo *>();
+  auto moduleMacro = newEntry.dyn_cast<clang::ModuleMacro *>();
+
   for (auto &existingEntry : entries) {
     // If it matches an existing declaration, there's nothing to do.
     if (decl && isDeclEntry(existingEntry) &&
         matchesExistingDecl(decl, mapStoredDecl(existingEntry)))
       return false;
 
-    // If it matches an existing macro, decide on the best course of action.
+    // If a textual macro matches an existing macro, just drop the new
+    // definition.
     if (macro && isMacroEntry(existingEntry)) {
-      MacroConflictAction action =
-         considerReplacingExistingMacro(macro,
-                                        mapStoredMacro(existingEntry),
-                                        PP);
-      switch (action) {
-      case MacroConflictAction::Discard:
+      return false;
+    }
+
+    // If a module macro matches an existing macro, be a bit more discerning.
+    //
+    // Specifically, if the innermost explicit submodule containing the new
+    // macro contains the innermost explicit submodule containing the existing
+    // macro, the new one should replace the old one; if they're the same
+    // module, the old one should stay in place. Otherwise, they don't share an
+    // explicit module, and should be considered alternatives.
+    //
+    // Note that the above assumes that macro definitions are processed in
+    // reverse order, i.e. the first definition seen is the last in a
+    // translation unit.
+    if (moduleMacro && isMacroEntry(existingEntry)) {
+      SingleEntry decodedEntry = mapStoredMacro(existingEntry,
+                                                /*assumeModule*/true);
+      const auto *existingMacro = decodedEntry.get<clang::ModuleMacro *>();
+
+      const clang::Module *newModule = moduleMacro->getOwningModule();
+      const clang::Module *existingModule = existingMacro->getOwningModule();
+
+      // A simple redeclaration: drop the new definition.
+      if (existingModule == newModule)
         return false;
-      case MacroConflictAction::Replace:
-        existingEntry = encodeEntry(macro);
+
+      // A broader-scoped redeclaration: drop the old definition.
+      if (existingModule->isSubModuleOf(newModule)) {
+        // FIXME: What if there are /multiple/ old definitions we should be
+        // dropping? What if one of the earlier early exits makes us miss
+        // entries later in the list that would match this?
+        existingEntry = encodeEntry(moduleMacro);
         return false;
-      case MacroConflictAction::AddAsAlternative:
-        break;
       }
+
+      // Otherwise, just allow both definitions to coexist.
     }
   }
 
   // Add an entry to this context.
   if (decl)
     entries.push_back(encodeEntry(decl));
-  else
+  else if (macro)
     entries.push_back(encodeEntry(macro));
+  else
+    entries.push_back(encodeEntry(moduleMacro));
   return true;
 }
 
 void SwiftLookupTable::addEntry(DeclName name, SingleEntry newEntry,
-                                EffectiveClangContext effectiveContext,
-                                const clang::Preprocessor *PP) {
-  assert(!Reader && "Cannot modify a lookup table stored on disk");
+                                EffectiveClangContext effectiveContext) {
+  assert(newEntry);
 
   // Translate the context.
   auto contextOpt = translateContext(effectiveContext);
@@ -389,22 +456,26 @@ void SwiftLookupTable::addEntry(DeclName name, SingleEntry newEntry,
     return;
   }
 
+  // Populate cache from reader if necessary.
+  findOrCreate(name.getBaseName());
+
   auto context = *contextOpt;
 
   // If this is a global imported as a member, record is as such.
   if (isGlobalAsMember(newEntry, context)) {
     auto &entries = GlobalsAsMembers[context];
-    (void)addLocalEntry(newEntry, entries, PP);
+    (void)addLocalEntry(newEntry, entries);
   }
 
   // Find the list of entries for this base name.
-  auto &entries = LookupTable[name.getBaseName().str()];
+  auto &entries = LookupTable[name.getBaseName()];
   auto decl = newEntry.dyn_cast<clang::NamedDecl *>();
   auto macro = newEntry.dyn_cast<clang::MacroInfo *>();
+  auto moduleMacro = newEntry.dyn_cast<clang::ModuleMacro *>();
   for (auto &entry : entries) {
     if (entry.Context == context) {
       // We have entries for this context.
-      (void)addLocalEntry(newEntry, entry.DeclsOrMacros, PP);
+      (void)addLocalEntry(newEntry, entry.DeclsOrMacros);
       return;
     }
   }
@@ -414,13 +485,16 @@ void SwiftLookupTable::addEntry(DeclName name, SingleEntry newEntry,
   entry.Context = context;
   if (decl)
     entry.DeclsOrMacros.push_back(encodeEntry(decl));
-  else
+  else if (macro)
     entry.DeclsOrMacros.push_back(encodeEntry(macro));
+  else
+    entry.DeclsOrMacros.push_back(encodeEntry(moduleMacro));
   entries.push_back(entry);
 }
 
-auto SwiftLookupTable::findOrCreate(StringRef baseName) 
-  -> llvm::DenseMap<StringRef, SmallVector<FullTableEntry, 2>>::iterator {
+auto SwiftLookupTable::findOrCreate(SerializedSwiftName baseName)
+    -> llvm::DenseMap<SerializedSwiftName,
+                      SmallVector<FullTableEntry, 2>>::iterator {
   // If there is no base name, there is nothing to find.
   if (baseName.empty()) return LookupTable.end();
 
@@ -444,7 +518,7 @@ auto SwiftLookupTable::findOrCreate(StringRef baseName)
 }
 
 SmallVector<SwiftLookupTable::SingleEntry, 4>
-SwiftLookupTable::lookup(StringRef baseName,
+SwiftLookupTable::lookup(SerializedSwiftName baseName,
                          llvm::Optional<StoredContext> searchContext) {
   SmallVector<SwiftLookupTable::SingleEntry, 4> result;
 
@@ -461,7 +535,8 @@ SwiftLookupTable::lookup(StringRef baseName,
 
     // Map each of the declarations.
     for (auto &stored : entry.DeclsOrMacros)
-      result.push_back(mapStored(stored));
+      if (auto entry = mapStored(stored))
+        result.push_back(entry);
   }
 
   return result;
@@ -480,7 +555,7 @@ SwiftLookupTable::lookupGlobalsAsMembers(StoredContext context) {
     if (!Reader) return result;
 
     // Lookup this base name in the module extension file.
-    SmallVector<uintptr_t, 2> results;
+    SmallVector<uint64_t, 2> results;
     (void)Reader->lookupGlobalsAsMembers(context, results);
 
     // Add an entry to the table so we don't look again.
@@ -533,7 +608,7 @@ SwiftLookupTable::allGlobalsAsMembers() {
 }
 
 SmallVector<SwiftLookupTable::SingleEntry, 4>
-SwiftLookupTable::lookup(StringRef baseName,
+SwiftLookupTable::lookup(SerializedSwiftName baseName,
                          EffectiveClangContext searchContext) {
   // Translate context.
   Optional<StoredContext> context;
@@ -545,12 +620,12 @@ SwiftLookupTable::lookup(StringRef baseName,
   return lookup(baseName, context);
 }
 
-SmallVector<StringRef, 4> SwiftLookupTable::allBaseNames() {
+SmallVector<SerializedSwiftName, 4> SwiftLookupTable::allBaseNames() {
   // If we have a reader, enumerate its base names.
   if (Reader) return Reader->getBaseNames();
 
   // Otherwise, walk the lookup table.
-  SmallVector<StringRef, 4> result;
+  SmallVector<SerializedSwiftName, 4> result;
   for (const auto &entry : LookupTable) {
     result.push_back(entry.first);
   }
@@ -558,7 +633,7 @@ SmallVector<StringRef, 4> SwiftLookupTable::allBaseNames() {
 }
 
 SmallVector<clang::NamedDecl *, 4>
-SwiftLookupTable::lookupObjCMembers(StringRef baseName) {
+SwiftLookupTable::lookupObjCMembers(SerializedSwiftName baseName) {
   SmallVector<clang::NamedDecl *, 4> result;
 
   // Find the lookup table entry for this base name.
@@ -688,12 +763,41 @@ static void printStoredContext(SwiftLookupTable::StoredContext context,
   }
 }
 
+static uint32_t getEncodedDeclID(uint64_t entry) {
+  assert(SwiftLookupTable::isSerializationIDEntry(entry)); 
+  assert(SwiftLookupTable::isDeclEntry(entry));
+  return entry >> 2;
+}
+
+namespace {
+struct LocalMacroIDs {
+  uint32_t moduleID;
+  uint32_t nameOrMacroID;
+};
+}
+
+static LocalMacroIDs getEncodedModuleMacroIDs(uint64_t entry) {
+  assert(SwiftLookupTable::isSerializationIDEntry(entry)); 
+  assert(SwiftLookupTable::isMacroEntry(entry));
+  return {static_cast<uint32_t>((entry & 0xFFFFFFFF) >> 2),
+          static_cast<uint32_t>(entry >> 32)};
+}
+
 /// Print a stored entry (Clang macro or declaration) for debugging purposes.
-static void printStoredEntry(const SwiftLookupTable *table, uintptr_t entry,
+static void printStoredEntry(const SwiftLookupTable *table, uint64_t entry,
                              llvm::raw_ostream &out) {
   if (SwiftLookupTable::isSerializationIDEntry(entry)) {
-    llvm::errs() << (SwiftLookupTable::isMacroEntry(entry) ? "macro" : "decl")
-                 << " ID #" << SwiftLookupTable::getSerializationID(entry);
+    if (SwiftLookupTable::isDeclEntry(entry)) {
+      llvm::errs() << "decl ID #" << getEncodedDeclID(entry);
+    } else {
+      LocalMacroIDs macroIDs = getEncodedModuleMacroIDs(entry);
+      if (macroIDs.moduleID == 0) {
+        llvm::errs() << "macro ID #" << macroIDs.nameOrMacroID;
+      } else {
+        llvm::errs() << "macro with name ID #" << macroIDs.nameOrMacroID
+                     << "in submodule #" << macroIDs.moduleID;
+      }
+    }
   } else if (SwiftLookupTable::isMacroEntry(entry)) {
     llvm::errs() << "Macro";
   } else {
@@ -704,14 +808,24 @@ static void printStoredEntry(const SwiftLookupTable *table, uintptr_t entry,
 
 void SwiftLookupTable::dump() const {
   // Dump the base name -> full table entry mappings.
-  SmallVector<StringRef, 4> baseNames;
+  SmallVector<SerializedSwiftName, 4> baseNames;
   for (const auto &entry : LookupTable) {
     baseNames.push_back(entry.first);
   }
   llvm::array_pod_sort(baseNames.begin(), baseNames.end());
   llvm::errs() << "Base name -> entry mappings:\n";
   for (auto baseName : baseNames) {
-    llvm::errs() << "  " << baseName << ":\n";
+    switch (baseName.Kind) {
+    case DeclBaseName::Kind::Normal:
+      llvm::errs() << "  " << baseName.Name << ":\n";
+      break;
+    case DeclBaseName::Kind::Subscript:
+      llvm::errs() << "  subscript:\n";
+      break;
+    case DeclBaseName::Kind::Destructor:
+      llvm::errs() << "  deinit:\n";
+      break;
+    }
     const auto &entries = LookupTable.find(baseName)->second;
     for (const auto &entry : entries) {
       llvm::errs() << "    ";
@@ -719,7 +833,7 @@ void SwiftLookupTable::dump() const {
       llvm::errs() << ": ";
 
       interleave(entry.DeclsOrMacros.begin(), entry.DeclsOrMacros.end(),
-                 [this](uintptr_t entry) {
+                 [this](uint64_t entry) {
                    printStoredEntry(this, entry, llvm::errs());
                  },
                  [] {
@@ -766,7 +880,7 @@ void SwiftLookupTable::dump() const {
 
       const auto &entries = GlobalsAsMembers.find(context)->second;
       interleave(entries.begin(), entries.end(),
-                 [this](uintptr_t entry) {
+                 [this](uint64_t entry) {
                    printStoredEntry(this, entry, llvm::errs());
                  },
                  [] {
@@ -814,11 +928,14 @@ namespace {
   /// Trait used to write the on-disk hash table for the base name -> entities
   /// mapping.
   class BaseNameToEntitiesTableWriterInfo {
+    static_assert(sizeof(DeclBaseName::Kind) <= sizeof(uint8_t),
+                  "kind serialized as uint8_t");
+
     SwiftLookupTable &Table;
     clang::ASTWriter &Writer;
 
   public:
-    using key_type = StringRef;
+    using key_type = SerializedSwiftName;
     using key_type_ref = key_type;
     using data_type = SmallVector<SwiftLookupTable::FullTableEntry, 2>;
     using data_type_ref = data_type &;
@@ -832,14 +949,16 @@ namespace {
     }
 
     hash_value_type ComputeHash(key_type_ref key) {
-      return llvm::HashString(key);
+      return llvm::DenseMapInfo<SerializedSwiftName>::getHashValue(key);
     }
 
     std::pair<unsigned, unsigned> EmitKeyDataLength(raw_ostream &out,
                                                     key_type_ref key,
                                                     data_type_ref data) {
-      // The length of the key.
-      uint32_t keyLength = key.size();
+      uint32_t keyLength = sizeof(uint8_t); // For the flag of the name's kind
+      if (key.Kind == DeclBaseName::Kind::Normal) {
+        keyLength += key.Name.size(); // The name's length
+      }
 
       // # of entries
       uint32_t dataLength = sizeof(uint16_t);
@@ -856,8 +975,7 @@ namespace {
         dataLength += sizeof(uint16_t);
 
         // Actual entries.
-        dataLength += (sizeof(clang::serialization::DeclID) *
-                       entry.DeclsOrMacros.size());
+        dataLength += (sizeof(uint64_t) * entry.DeclsOrMacros.size());
       }
 
       endian::Writer<little> writer(out);
@@ -867,7 +985,10 @@ namespace {
     }
 
     void EmitKey(raw_ostream &out, key_type_ref key, unsigned len) {
-      out << key;
+      endian::Writer<little> writer(out);
+      writer.write<uint8_t>((uint8_t)key.Kind);
+      if (key.Kind == swift::DeclBaseName::Kind::Normal)
+        writer.OS << key.Name;
     }
 
     void EmitData(raw_ostream &out, key_type_ref key, data_type_ref data,
@@ -877,6 +998,7 @@ namespace {
       // # of entries
       writer.write<uint16_t>(data.size());
 
+      bool isModule = Writer.getLangOpts().isCompilingModule();
       for (auto &fullEntry : data) {
         // Context.
         writer.write<uint8_t>(static_cast<uint8_t>(fullEntry.Context.first));
@@ -890,15 +1012,22 @@ namespace {
 
         // Write the declarations and macros.
         for (auto &entry : fullEntry.DeclsOrMacros) {
-          uint32_t id;
-          if (SwiftLookupTable::isDeclEntry(entry)) {
-            auto decl = Table.mapStoredDecl(entry);
+          uint64_t id;
+          auto mappedEntry = Table.mapStored(entry, isModule);
+          if (auto *decl = mappedEntry.dyn_cast<clang::NamedDecl *>()) {
             id = (Writer.getDeclID(decl) << 2) | 0x02;
+          } else if (auto *macro = mappedEntry.dyn_cast<clang::MacroInfo *>()) {
+            id = static_cast<uint64_t>(Writer.getMacroID(macro)) << 32;
+            id |= 0x02 | 0x01;
           } else {
-            auto macro = Table.mapStoredMacro(entry);
-            id = (Writer.getMacroID(macro) << 2) | 0x02 | 0x01;
+            auto *moduleMacro = mappedEntry.get<clang::ModuleMacro *>();
+            uint32_t nameID = Writer.getIdentifierRef(moduleMacro->getName());
+            uint32_t submoduleID = Writer.getLocalOrImportedSubmoduleID(
+                moduleMacro->getOwningModule());
+            id = (static_cast<uint64_t>(nameID) << 32) | (submoduleID << 2);
+            id |= 0x02 | 0x01;
           }
-          writer.write<uint32_t>(id);
+          writer.write<uint64_t>(id);
         }
       }
     }
@@ -913,7 +1042,7 @@ namespace {
   public:
     using key_type = std::pair<SwiftLookupTable::ContextKind, StringRef>;
     using key_type_ref = key_type;
-    using data_type = SmallVector<uintptr_t, 2>;
+    using data_type = SmallVector<uint64_t, 2>;
     using data_type_ref = data_type &;
     using hash_value_type = uint32_t;
     using offset_type = unsigned;
@@ -938,7 +1067,7 @@ namespace {
 
       // # of entries
       uint32_t dataLength =
-        sizeof(uint16_t) + sizeof(clang::serialization::DeclID) * data.size();
+        sizeof(uint16_t) + sizeof(uint64_t) * data.size();
 
       endian::Writer<little> writer(out);
       writer.write<uint16_t>(keyLength);
@@ -961,32 +1090,42 @@ namespace {
       writer.write<uint16_t>(data.size());
 
       // Actual entries.
+      bool isModule = Writer.getLangOpts().isCompilingModule();
       for (auto &entry : data) {
-        uint32_t id;
-        if (SwiftLookupTable::isDeclEntry(entry)) {
-          auto decl = Table.mapStoredDecl(entry);
+        uint64_t id;
+        auto mappedEntry = Table.mapStored(entry, isModule);
+        if (auto *decl = mappedEntry.dyn_cast<clang::NamedDecl *>()) {
           id = (Writer.getDeclID(decl) << 2) | 0x02;
+        } else if (auto *macro = mappedEntry.dyn_cast<clang::MacroInfo *>()) {
+          id = static_cast<uint64_t>(Writer.getMacroID(macro)) << 32;
+          id |= 0x02 | 0x01;
         } else {
-          auto macro = Table.mapStoredMacro(entry);
-          id = (Writer.getMacroID(macro) << 2) | 0x02 | 0x01;
+          auto *moduleMacro = mappedEntry.get<clang::ModuleMacro *>();
+          uint32_t nameID = Writer.getIdentifierRef(moduleMacro->getName());
+          uint32_t submoduleID = Writer.getLocalOrImportedSubmoduleID(
+              moduleMacro->getOwningModule());
+          id = (static_cast<uint64_t>(nameID) << 32) | (submoduleID << 2);
+          id |= 0x02 | 0x01;
         }
-        writer.write<uint32_t>(id);
+        writer.write<uint64_t>(id);
       }
     }
   };
-}
+} // end anonymous namespace
 
 void SwiftLookupTableWriter::writeExtensionContents(
        clang::Sema &sema,
        llvm::BitstreamWriter &stream) {
+  NameImporter nameImporter(swiftCtx, availability, sema, inferImportAsMember);
+
   // Populate the lookup table.
   SwiftLookupTable table(nullptr);
-  PopulateTable(sema, table);
+  populateTable(table, nameImporter);
 
   SmallVector<uint64_t, 64> ScratchRecord;
 
   // First, gather the sorted list of base names.
-  SmallVector<StringRef, 2> baseNames;
+  SmallVector<SerializedSwiftName, 2> baseNames;
   for (const auto &entry : table.LookupTable)
     baseNames.push_back(entry.first);
   llvm::array_pod_sort(baseNames.begin(), baseNames.end());
@@ -1059,7 +1198,7 @@ namespace {
   /// Used to deserialize the on-disk base name -> entities table.
   class BaseNameToEntitiesTableReaderInfo {
   public:
-    using internal_key_type = StringRef;
+    using internal_key_type = SerializedSwiftName;
     using external_key_type = internal_key_type;
     using data_type = SmallVector<SwiftLookupTable::FullTableEntry, 2>;
     using hash_value_type = uint32_t;
@@ -1074,7 +1213,7 @@ namespace {
     }
 
     hash_value_type ComputeHash(internal_key_type key) {
-      return llvm::HashString(key);
+      return llvm::DenseMapInfo<SerializedSwiftName>::getHashValue(key);
     }
 
     static bool EqualKey(internal_key_type lhs, internal_key_type rhs) {
@@ -1089,7 +1228,18 @@ namespace {
     }
 
     static internal_key_type ReadKey(const uint8_t *data, unsigned length) {
-      return StringRef((const char *)data, length);
+      uint8_t kind = endian::readNext<uint8_t, little, unaligned>(data);
+      switch (kind) {
+      case (uint8_t)DeclBaseName::Kind::Normal: {
+        StringRef str(reinterpret_cast<const char *>(data),
+                      length - sizeof(uint8_t));
+        return SerializedSwiftName(str);
+      }
+      case (uint8_t)DeclBaseName::Kind::Subscript:
+        return SerializedSwiftName(DeclBaseName::Kind::Subscript);
+      default:
+        llvm_unreachable("Unknown kind for DeclBaseName");
+      }
     }
 
     static data_type ReadData(internal_key_type key, const uint8_t *data,
@@ -1118,7 +1268,7 @@ namespace {
         unsigned numDeclsOrMacros =
           endian::readNext<uint16_t, little, unaligned>(data);
         while (numDeclsOrMacros--) {
-          auto id = endian::readNext<uint32_t, little, unaligned>(data);
+          auto id = endian::readNext<uint64_t, little, unaligned>(data);
           entry.DeclsOrMacros.push_back(id);
         }
 
@@ -1134,7 +1284,7 @@ namespace {
   public:
     using internal_key_type = SwiftLookupTable::StoredContext;
     using external_key_type = internal_key_type;
-    using data_type = SmallVector<uintptr_t, 2>;
+    using data_type = SmallVector<uint64_t, 2>;
     using hash_value_type = uint32_t;
     using offset_type = unsigned;
 
@@ -1177,14 +1327,14 @@ namespace {
 
       // Read all of the entries.
       while (numEntries--) {
-        auto id = endian::readNext<uint32_t, little, unaligned>(data);
+        auto id = endian::readNext<uint64_t, little, unaligned>(data);
         result.push_back(id);
       }
 
       return result;
     }
   };
-}
+} // end anonymous namespace
 
 namespace swift {
   using SerializedBaseNameToEntitiesTable =
@@ -1192,9 +1342,9 @@ namespace swift {
 
   using SerializedGlobalsAsMembersTable =
     llvm::OnDiskIterableChainedHashTable<GlobalsAsMembersTableReaderInfo>;
-}
+} // namespace swift
 
-clang::NamedDecl *SwiftLookupTable::mapStoredDecl(uintptr_t &entry) {
+clang::NamedDecl *SwiftLookupTable::mapStoredDecl(uint64_t &entry) {
   assert(isDeclEntry(entry) && "Not a declaration entry");
 
   // If we have an AST node here, just cast it.
@@ -1204,7 +1354,7 @@ clang::NamedDecl *SwiftLookupTable::mapStoredDecl(uintptr_t &entry) {
 
   // Otherwise, resolve the declaration.
   assert(Reader && "Cannot resolve the declaration without a reader");
-  clang::serialization::DeclID declID = getSerializationID(entry);
+  uint32_t declID = getEncodedDeclID(entry);
   auto decl = cast_or_null<clang::NamedDecl>(
                 Reader->getASTReader().GetLocalDecl(Reader->getModuleFile(),
                                                     declID));
@@ -1214,33 +1364,66 @@ clang::NamedDecl *SwiftLookupTable::mapStoredDecl(uintptr_t &entry) {
   return decl;
 }
 
-clang::MacroInfo *SwiftLookupTable::mapStoredMacro(uintptr_t &entry) {
+static bool isPCH(SwiftLookupTableReader &reader) {
+  return reader.getModuleFile().Kind == clang::serialization::MK_PCH;
+}
+
+SwiftLookupTable::SingleEntry
+SwiftLookupTable::mapStoredMacro(uint64_t &entry, bool assumeModule) {
   assert(isMacroEntry(entry) && "Not a macro entry");
 
   // If we have an AST node here, just cast it.
   if (isASTNodeEntry(entry)) {
-    return static_cast<clang::MacroInfo *>(getPointerFromEntry(entry));
+    if (assumeModule || (Reader && !isPCH(*Reader)))
+      return static_cast<clang::ModuleMacro *>(getPointerFromEntry(entry));
+    else
+      return static_cast<clang::MacroInfo *>(getPointerFromEntry(entry));
   }
 
   // Otherwise, resolve the macro.
   assert(Reader && "Cannot resolve the macro without a reader");
-  clang::serialization::MacroID macroID = getSerializationID(entry);
-  auto macro = cast_or_null<clang::MacroInfo>(
-                Reader->getASTReader().getMacro(
-                  Reader->getASTReader().getGlobalMacroID(
-                    Reader->getModuleFile(),
-                    macroID)));
+  clang::ASTReader &astReader = Reader->getASTReader();
 
-  // Update the entry now that we've resolved the macro.
-  entry = encodeEntry(macro);
+  LocalMacroIDs macroIDs = getEncodedModuleMacroIDs(entry);
+  if (!assumeModule && macroIDs.moduleID == 0) {
+    assert(isPCH(*Reader));
+    // Not a module, and the second key is actually a macroID.
+    auto macro =
+        astReader.getMacro(astReader.getGlobalMacroID(Reader->getModuleFile(),
+                                                      macroIDs.nameOrMacroID));
+
+    // Update the entry now that we've resolved the macro.
+    entry = encodeEntry(macro);
+    return macro;
+  }
+
+  // FIXME: Clang should help us out here, but it doesn't. It can only give us
+  // MacroInfos and not ModuleMacros.
+  assert(!isPCH(*Reader));
+  clang::IdentifierInfo *name =
+      astReader.getLocalIdentifier(Reader->getModuleFile(), 
+                                   macroIDs.nameOrMacroID);
+  auto submoduleID = astReader.getGlobalSubmoduleID(Reader->getModuleFile(), 
+                                                    macroIDs.moduleID);
+  clang::Module *submodule = astReader.getSubmodule(submoduleID);
+  assert(submodule);
+
+  clang::Preprocessor &pp = Reader->getASTReader().getPreprocessor();
+  // Force the ModuleMacro to be loaded if this module is visible.
+  (void)pp.getLeafModuleMacros(name);
+  clang::ModuleMacro *macro = pp.getModuleMacro(submodule, name);
+  // This might still be NULL if the module has been imported but not made
+  // visible. We need a better answer here.
+  if (macro)
+    entry = encodeEntry(macro);
   return macro;
 }
 
-SwiftLookupTable::SingleEntry SwiftLookupTable::mapStored(uintptr_t &entry) {
+SwiftLookupTable::SingleEntry SwiftLookupTable::mapStored(uint64_t &entry,
+                                                          bool assumeModule) {
   if (isDeclEntry(entry))
     return mapStoredDecl(entry);
-
-  return mapStoredMacro(entry);
+  return mapStoredMacro(entry, assumeModule);
 }
 
 SwiftLookupTableReader::~SwiftLookupTableReader() {
@@ -1344,9 +1527,9 @@ SwiftLookupTableReader::create(clang::ModuleFileExtension *extension,
 
 }
 
-SmallVector<StringRef, 4> SwiftLookupTableReader::getBaseNames() {
+SmallVector<SerializedSwiftName, 4> SwiftLookupTableReader::getBaseNames() {
   auto table = static_cast<SerializedBaseNameToEntitiesTable*>(SerializedTable);
-  SmallVector<StringRef, 4> results;
+  SmallVector<SerializedSwiftName, 4> results;
   for (auto key : table->keys()) {
     results.push_back(key);
   }
@@ -1354,8 +1537,8 @@ SmallVector<StringRef, 4> SwiftLookupTableReader::getBaseNames() {
 }
 
 bool SwiftLookupTableReader::lookup(
-       StringRef baseName,
-       SmallVectorImpl<SwiftLookupTable::FullTableEntry> &entries) {
+    SerializedSwiftName baseName,
+    SmallVectorImpl<SwiftLookupTable::FullTableEntry> &entries) {
   auto table = static_cast<SerializedBaseNameToEntitiesTable*>(SerializedTable);
 
   // Look for an entry with this base name.
@@ -1383,7 +1566,7 @@ SwiftLookupTableReader::getGlobalsAsMembersContexts() {
 
 bool SwiftLookupTableReader::lookupGlobalsAsMembers(
        SwiftLookupTable::StoredContext context,
-       SmallVectorImpl<uintptr_t> &entries) {
+       SmallVectorImpl<uint64_t> &entries) {
   auto table =
     static_cast<SerializedGlobalsAsMembersTable*>(GlobalsAsMembersTable);
   if (!table) return false;
@@ -1396,3 +1579,257 @@ bool SwiftLookupTableReader::lookupGlobalsAsMembers(
   entries = std::move(*known);
   return true;
 }
+
+clang::ModuleFileExtensionMetadata
+SwiftNameLookupExtension::getExtensionMetadata() const {
+  clang::ModuleFileExtensionMetadata metadata;
+  metadata.BlockName = "swift.lookup";
+  metadata.MajorVersion = SWIFT_LOOKUP_TABLE_VERSION_MAJOR;
+  metadata.MinorVersion = SWIFT_LOOKUP_TABLE_VERSION_MINOR;
+  metadata.UserInfo =
+      version::getSwiftFullVersion(swiftCtx.LangOpts.EffectiveLanguageVersion);
+  return metadata;
+}
+
+llvm::hash_code
+SwiftNameLookupExtension::hashExtension(llvm::hash_code code) const {
+  return llvm::hash_combine(code, StringRef("swift.lookup"),
+                            SWIFT_LOOKUP_TABLE_VERSION_MAJOR,
+                            SWIFT_LOOKUP_TABLE_VERSION_MINOR,
+                            inferImportAsMember);
+}
+
+void importer::addEntryToLookupTable(SwiftLookupTable &table,
+                                     clang::NamedDecl *named,
+                                     NameImporter &nameImporter) {
+  // Determine whether this declaration is suppressed in Swift.
+  if (shouldSuppressDeclImport(named))
+    return;
+
+  // Leave incomplete struct/enum/union types out of the table; Swift only
+  // handles pointers to them.
+  // FIXME: At some point we probably want to be importing incomplete types,
+  // so that pointers to different incomplete types themselves have distinct
+  // types. At that time it will be necessary to make the decision of whether
+  // or not to import an incomplete type declaration based on whether it's
+  // actually the struct backing a CF type:
+  //
+  //    typedef struct CGColor *CGColorRef;
+  //
+  // The best way to do this is probably to change CFDatabase.def to include
+  // struct names when relevant, not just pointer names. That way we can check
+  // both CFDatabase.def and the objc_bridge attribute and cover all our bases.
+  if (auto *tagDecl = dyn_cast<clang::TagDecl>(named)) {
+    if (!tagDecl->getDefinition())
+      return;
+  }
+
+  // If we have a name to import as, add this entry to the table.
+  auto currentVersion =
+      ImportNameVersion::fromOptions(nameImporter.getLangOpts());
+  if (auto importedName = nameImporter.importName(named, currentVersion)) {
+    SmallPtrSet<DeclName, 8> distinctNames;
+    distinctNames.insert(importedName.getDeclName());
+    table.addEntry(importedName.getDeclName(), named,
+                   importedName.getEffectiveContext());
+
+    // Also add the subscript entry, if needed.
+    if (importedName.isSubscriptAccessor())
+      table.addEntry(DeclName(nameImporter.getContext(),
+                              DeclBaseName::createSubscript(),
+                              ArrayRef<Identifier>()),
+                     named, importedName.getEffectiveContext());
+
+    currentVersion.forEachOtherImportNameVersion(
+        [&](ImportNameVersion alternateVersion) {
+      auto alternateName = nameImporter.importName(named, alternateVersion);
+      if (!alternateName)
+        return;
+      // FIXME: What if the DeclNames are the same but the contexts are
+      // different?
+      if (distinctNames.insert(alternateName.getDeclName()).second) {
+        table.addEntry(alternateName.getDeclName(), named,
+                       alternateName.getEffectiveContext());
+      }
+    });
+  } else if (auto category = dyn_cast<clang::ObjCCategoryDecl>(named)) {
+    // If the category is invalid, don't add it.
+    if (category->isInvalidDecl())
+      return;
+
+    table.addCategory(category);
+  }
+
+  // Walk the members of any context that can have nested members.
+  if (isa<clang::TagDecl>(named) || isa<clang::ObjCInterfaceDecl>(named) ||
+      isa<clang::ObjCProtocolDecl>(named) ||
+      isa<clang::ObjCCategoryDecl>(named)) {
+    clang::DeclContext *dc = cast<clang::DeclContext>(named);
+    for (auto member : dc->decls()) {
+      if (auto namedMember = dyn_cast<clang::NamedDecl>(member))
+        addEntryToLookupTable(table, namedMember, nameImporter);
+    }
+  }
+}
+
+void importer::addMacrosToLookupTable(SwiftLookupTable &table,
+                                      NameImporter &nameImporter) {
+  auto &pp = nameImporter.getClangPreprocessor();
+  auto *tu = nameImporter.getClangContext().getTranslationUnitDecl();
+  bool isModule = pp.getLangOpts().isCompilingModule();
+  for (const auto &macro : pp.macros(false)) {
+    auto maybeAddMacro = [&](clang::MacroInfo *info,
+                             clang::ModuleMacro *moduleMacro) {
+      // If this is a #undef, return.
+      if (!info)
+        return;
+
+      // If we hit a builtin macro, we're done.
+      if (info->isBuiltinMacro())
+        return;
+
+      // If we hit a macro with invalid or predefined location, we're done.
+      auto loc = info->getDefinitionLoc();
+      if (loc.isInvalid())
+        return;
+      if (pp.getSourceManager().getFileID(loc) == pp.getPredefinesFileID())
+        return;
+
+      // If we're in a module, we really need moduleMacro to be valid.
+      if (isModule && !moduleMacro) {
+#ifndef NDEBUG
+        // Refetch this just for the assertion.
+        clang::MacroDirective *MD = pp.getLocalMacroDirective(macro.first);
+        assert(isa<clang::VisibilityMacroDirective>(MD));
+#endif
+
+        // FIXME: "public" visibility macros should actually be added to the 
+        // table.
+        return;
+      }
+
+      // Add this entry.
+      auto name = nameImporter.importMacroName(macro.first, info);
+      if (name.empty())
+        return;
+      if (moduleMacro)
+        table.addEntry(name, moduleMacro, tu);
+      else
+        table.addEntry(name, info, tu);
+    };
+
+    ArrayRef<clang::ModuleMacro *> moduleMacros =
+        macro.second.getActiveModuleMacros(pp, macro.first);
+    if (moduleMacros.empty()) {
+      // Handle the bridging header case.
+      clang::MacroDirective *MD = pp.getLocalMacroDirective(macro.first);
+      if (!MD)
+        continue;
+
+      maybeAddMacro(MD->getMacroInfo(), nullptr);
+
+    } else {
+      SmallVector<clang::ModuleMacro *, 8> worklist;
+      worklist.append(moduleMacros.begin(), moduleMacros.end());
+      while (!worklist.empty()) {
+        clang::ModuleMacro *moduleMacro = worklist.pop_back_val();
+        clang::Module *owningModule = moduleMacro->getOwningModule();
+        if (!owningModule->isSubModuleOf(pp.getCurrentModule()))
+          continue;
+        worklist.append(moduleMacro->overrides_begin(),
+                        moduleMacro->overrides_end());
+        maybeAddMacro(moduleMacro->getMacroInfo(), moduleMacro);
+      }
+    }
+  }
+}
+
+void importer::finalizeLookupTable(SwiftLookupTable &table,
+                                   NameImporter &nameImporter) {
+  // Resolve any unresolved entries.
+  SmallVector<SwiftLookupTable::SingleEntry, 4> unresolved;
+  if (table.resolveUnresolvedEntries(unresolved)) {
+    // Complain about unresolved entries that remain.
+    for (auto entry : unresolved) {
+      auto decl = entry.get<clang::NamedDecl *>();
+      auto swiftName = decl->getAttr<clang::SwiftNameAttr>();
+
+      nameImporter.getContext().Diags.diagnose(
+          SourceLoc(), diag::unresolvable_clang_decl, decl->getNameAsString(),
+          swiftName->getName());
+    }
+  }
+}
+
+void SwiftLookupTableWriter::populateTable(SwiftLookupTable &table,
+                                           NameImporter &nameImporter) {
+  auto &sema = nameImporter.getClangSema();
+  for (auto decl : sema.Context.getTranslationUnitDecl()->noload_decls()) {
+    // Skip anything from an AST file.
+    if (decl->isFromASTFile())
+      continue;
+
+    // Skip non-named declarations.
+    auto named = dyn_cast<clang::NamedDecl>(decl);
+    if (!named)
+      continue;
+
+    // Add this entry to the lookup table.
+    addEntryToLookupTable(table, named, nameImporter);
+  }
+
+  // Add macros to the lookup table.
+  addMacrosToLookupTable(table, nameImporter);
+
+  // Finalize the lookup table, which may fail.
+  finalizeLookupTable(table, nameImporter);
+};
+
+std::unique_ptr<clang::ModuleFileExtensionWriter>
+SwiftNameLookupExtension::createExtensionWriter(clang::ASTWriter &writer) {
+  return std::unique_ptr<clang::ModuleFileExtensionWriter>(
+      new SwiftLookupTableWriter(this, writer, swiftCtx, availability,
+                                 inferImportAsMember));
+}
+
+std::unique_ptr<clang::ModuleFileExtensionReader>
+SwiftNameLookupExtension::createExtensionReader(
+    const clang::ModuleFileExtensionMetadata &metadata,
+    clang::ASTReader &reader, clang::serialization::ModuleFile &mod,
+    const llvm::BitstreamCursor &stream) {
+  // Make sure we have a compatible block. Since these values are part
+  // of the hash, it should never be wrong.
+  assert(metadata.BlockName == "swift.lookup");
+  assert(metadata.MajorVersion == SWIFT_LOOKUP_TABLE_VERSION_MAJOR);
+  assert(metadata.MinorVersion == SWIFT_LOOKUP_TABLE_VERSION_MINOR);
+
+  std::function<void()> onRemove = [](){};
+  std::unique_ptr<SwiftLookupTable> *target = nullptr;
+
+  if (mod.Kind == clang::serialization::MK_PCH) {
+    // PCH imports unconditionally overwrite the provided pchLookupTable.
+    target = &pchLookupTable;
+  } else {
+    // Check whether we already have an entry in the set of lookup tables.
+    target = &lookupTables[mod.ModuleName];
+    if (*target) return nullptr;
+
+    // Local function used to remove this entry when the reader goes away.
+    std::string moduleName = mod.ModuleName;
+    onRemove = [this, moduleName]() {
+      lookupTables.erase(moduleName);
+    };
+  }
+
+  // Create the reader.
+  auto tableReader = SwiftLookupTableReader::create(this, reader, mod, onRemove,
+                                                    stream);
+  if (!tableReader) return nullptr;
+
+  // Create the lookup table.
+  target->reset(new SwiftLookupTable(tableReader.get()));
+
+  // Return the new reader.
+  return std::move(tableReader);
+}
+

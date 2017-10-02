@@ -1,4 +1,4 @@
-// RUN: %target-swift-frontend -emit-sil %s -parse-stdlib -o /dev/null -verify
+// RUN: %target-swift-frontend -emit-sil -enable-sil-ownership %s -parse-stdlib -o /dev/null -verify
 
 import Swift
 
@@ -14,6 +14,7 @@ func test1() -> Int {
 }
 
 func takes_inout(_ a: inout Int) {}
+func takes_inout_any(_ a: inout Any) {}
 func takes_closure(_ fn: () -> ()) {}
 
 class SomeClass { 
@@ -47,7 +48,7 @@ func test2() {
   // Address-of with Builtin.addressof.
   var a4 : Int            // expected-note {{variable defined here}}
   Builtin.addressof(&a4)  // expected-error {{address of variable 'a4' taken before it is initialized}}
-  // expected-warning @-1 {{result of call is unused, but produces 'Builtin.RawPointer'}}
+  // expected-warning @-1 {{result of call to 'addressof' is unused}}
 
 
   // Closures.
@@ -81,6 +82,11 @@ func test2() {
     markUsed(b4!)
   }
   b4 = 7
+  
+  let b5: Any
+  b5 = "x"   
+  { takes_inout_any(&b5) }()   // expected-error {{immutable value 'b5' must not be passed inout}}
+  ({ takes_inout_any(&b5) })()   // expected-error {{immutable value 'b5' must not be passed inout}}
 
   // Structs
   var s1 : SomeStruct
@@ -702,6 +708,19 @@ class r18199087SubClassA: r18199087BaseClass {
   }
 }
 
+class r18199087BaseClassNonTrivial {
+  let data: SomeClass
+  init(val: SomeClass) {
+    data = val
+  }
+}
+
+class r18199087SubClassANonTrivial: r18199087BaseClassNonTrivial {
+  init() {
+    super.init(val: self.data)  // expected-error {{use of 'self' in property access 'data' before super.init initializes self}}
+  }
+}
+
 // <rdar://problem/18414728> QoI: DI should talk about "implicit use of self" instead of individual properties in some cases
 class rdar18414728Base {
   var prop:String? { return "boo" }
@@ -855,7 +874,7 @@ struct LetProperties {
     u = 1; v = 13; w = (1,2); y = 1 ; z = u
 
     var variable = 42
-    swap(&u, &variable)  // expected-error {{immutable value 'self.u' may not be passed inout}}
+    swap(&u, &variable)  // expected-error {{immutable value 'self.u' must not be passed inout}}
     
     u.inspect()  // ok, non mutating.
     u.mutate()  // expected-error {{mutating method 'mutate' may not be used on immutable value 'self.u'}}
@@ -863,7 +882,7 @@ struct LetProperties {
     arr = []
     arr += []      // expected-error {{mutating operator '+=' may not be used on immutable value 'self.arr'}}
     arr.append(4)  // expected-error {{mutating method 'append' may not be used on immutable value 'self.arr'}}
-    arr[12] = 17   // expected-error {{immutable value 'self.arr' may not be assigned to}}
+    arr[12] = 17   // expected-error {{mutating subscript 'subscript' may not be used on immutable value 'self.arr'}}
   }
 }
 
@@ -926,7 +945,7 @@ func testAddressOnlyProperty<T>(_ b : T) -> T {
   x = b   // expected-error {{immutable value 'x' may only be initialized once}}
 
   var tmp = b
-  swap(&x, &tmp)   // expected-error {{immutable value 'x' may not be passed inout}}
+  swap(&x, &tmp)   // expected-error {{immutable value 'x' must not be passed inout}}
   return y
 }
 
@@ -977,7 +996,7 @@ struct StructMutatingMethodTest {
     x += 1     // expected-error {{mutating operator '+=' may not be used on immutable value 'self.x'}}
 
     y = 12
-    myTransparentFunction(&y)  // expected-error {{immutable value 'self.y' may not be passed inout}}
+    myTransparentFunction(&y)  // expected-error {{immutable value 'self.y' must not be passed inout}}
   }
 }
 
@@ -1116,12 +1135,12 @@ func bug22436880(_ x: UnsafeMutablePointer<Int>) {}
 func test22436880() {
   let x: Int
   x = 1
-  bug22436880(&x) // expected-error {{immutable value 'x' may not be passed inout}}
+  bug22436880(&x) // expected-error {{immutable value 'x' must not be passed inout}}
 }
 
 // sr-184
 let x: String? // expected-note 2 {{constant defined here}}
-print(x?.characters.count as Any) // expected-error {{constant 'x' used before being initialized}}
+print(x?.count as Any) // expected-error {{constant 'x' used before being initialized}}
 print(x!) // expected-error {{constant 'x' used before being initialized}}
 
 
@@ -1246,3 +1265,29 @@ enum SR1469_Enum3 {
   } // expected-error {{return from enum initializer method without storing to 'self'}}
 }
 
+class BadFooSuper {
+  init() {}
+  init(_ x: BadFooSuper) {}
+}
+
+class BadFooSubclass: BadFooSuper {
+  override init() {
+    super.init(self) // expected-error {{'self' used before super.init call}}
+  }
+}
+
+class SuperConvenienceBase {
+  public init(_ i: Int) {}
+  public convenience init(_ i1: Int, _ i2: Int) {
+    self.init(i2)
+  }
+}
+
+class SuperConvenienceSub : SuperConvenienceBase {
+  public override init(_ i: Int) {
+    super.init(i)
+  }
+  public init(_ i1: Int, _ i2: Int, _ i3: Int) {
+    self.init(i1, i1)
+  }
+}

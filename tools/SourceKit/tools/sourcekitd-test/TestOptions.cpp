@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -26,9 +26,9 @@ namespace {
 // Create enum with OPT_xxx values for each option in Options.td.
 enum Opt {
   OPT_INVALID = 0,
-#define OPTION(PREFIX, NAME, ID, KIND, GROUP, ALIAS, ALIASARGS, FLAGS, PARAM, \
-               HELP, META) \
-          OPT_##ID,
+#define OPTION(PREFIX, NAME, ID, KIND, GROUP, ALIAS, ALIASARGS, FLAGS, PARAM,  \
+               HELP, META, VALUES)                                             \
+  OPT_##ID,
 #include "Options.inc"
   LastOption
 #undef OPTION
@@ -41,10 +41,12 @@ enum Opt {
 
 // Create table mapping all options defined in Options.td.
 static const llvm::opt::OptTable::Info InfoTable[] = {
-#define OPTION(PREFIX, NAME, ID, KIND, GROUP, ALIAS, ALIASARGS, FLAGS, PARAM, \
-               HELPTEXT, METAVAR)   \
-  { PREFIX, NAME, HELPTEXT, METAVAR, OPT_##ID, llvm::opt::Option::KIND##Class, \
-    PARAM, FLAGS, OPT_##GROUP, OPT_##ALIAS, ALIASARGS },
+#define OPTION(PREFIX, NAME, ID, KIND, GROUP, ALIAS, ALIASARGS, FLAGS, PARAM,  \
+               HELPTEXT, METAVAR, VALUES)                                      \
+  {PREFIX,      NAME,      HELPTEXT,                                           \
+   METAVAR,     OPT_##ID,  llvm::opt::Option::KIND##Class,                     \
+   PARAM,       FLAGS,     OPT_##GROUP,                                        \
+   OPT_##ALIAS, ALIASARGS, VALUES},
 #include "Options.inc"
 #undef OPTION
 };
@@ -55,7 +57,7 @@ public:
   TestOptTable() : OptTable(InfoTable, llvm::array_lengthof(InfoTable)){}
 };
 
-} // namespace anonymous
+} // end anonymous namespace
 
 static std::pair<unsigned, unsigned> parseLineCol(StringRef LineCol) {
   unsigned Line, Col;
@@ -130,17 +132,37 @@ bool TestOptions::parseArgs(llvm::ArrayRef<const char *> Args) {
         .Case("print-diags", SourceKitRequest::PrintDiags)
         .Case("extract-comment", SourceKitRequest::ExtractComment)
         .Case("module-groups", SourceKitRequest::ModuleGroups)
+        .Case("range", SourceKitRequest::RangeInfo)
+        .Case("syntactic-rename", SourceKitRequest::SyntacticRename)
+        .Case("find-rename-ranges", SourceKitRequest::FindRenameRanges)
+        .Case("find-local-rename-ranges", SourceKitRequest::FindLocalRenameRanges)
+        .Case("translate", SourceKitRequest::NameTranslation)
+        .Case("local-rename", SourceKitRequest::LocalRename)
+        .Case("extract-expr", SourceKitRequest::ExtractExpr)
+        .Case("extract-repeated", SourceKitRequest::ExtractRepeatedExpr)
+        .Case("extract-func", SourceKitRequest::ExtractFunction)
+        .Case("fill-stub", SourceKitRequest::FillProtocolStub)
+        .Case("expand-default", SourceKitRequest::ExpandDefault)
+        .Case("localize-string", SourceKitRequest::LocalizeString)
+        .Case("markup-xml", SourceKitRequest::MarkupToXML)
         .Default(SourceKitRequest::None);
+
       if (Request == SourceKitRequest::None) {
         llvm::errs() << "error: invalid request, expected one of "
             << "version/demangle/mangle/index/complete/complete.open/complete.cursor/"
                "complete.update/complete.cache.ondisk/complete.cache.setpopularapi/"
                "cursor/related-idents/syntax-map/structure/format/expand-placeholder/"
                "doc-info/sema/interface-gen/interface-gen-openfind-usr/find-interface/"
-               "open/edit/print-annotations/print-diags/extract-comment/module-groups\n";
+               "open/edit/print-annotations/print-diags/extract-comment/module-groups/"
+               "range/syntactic-rename/find-rename-ranges/translate/markup-xml\n";
         return true;
       }
       break;
+
+    case OPT_help: {
+      printHelp(false);
+      return true;
+    }
 
     case OPT_offset:
       if (StringRef(InputArg->getValue()).getAsInteger(10, Offset)) {
@@ -162,6 +184,28 @@ bool TestOptions::parseArgs(llvm::ArrayRef<const char *> Args) {
       Col = linecol.second;
       break;
     }
+
+    case OPT_end_pos: {
+      auto linecol = parseLineCol(InputArg->getValue());
+      EndLine = linecol.first;
+      EndCol = linecol.second;
+      break;
+    }
+
+    case OPT_using_swift_args: {
+      UsingSwiftArgs = true;
+      break;
+    }
+
+      case OPT_swift_version: {
+        unsigned ver;
+        if (StringRef(InputArg->getValue()).getAsInteger(10, ver)) {
+          llvm::errs() << "error: expected integer for 'swift-version'\n";
+          return true;
+        }
+        SwiftVersion = ver;
+        break;
+      }
 
     case OPT_line:
       if (StringRef(InputArg->getValue()).getAsInteger(10, Line)) {
@@ -234,6 +278,10 @@ bool TestOptions::parseArgs(llvm::ArrayRef<const char *> Args) {
       Inputs.push_back(InputArg->getValue());
       break;
 
+    case OPT_rename_spec:
+      RenameSpecPath = InputArg->getValue();
+      break;
+
     case OPT_json_request_path:
       JsonRequestPath = InputArg->getValue();
       break;
@@ -250,9 +298,39 @@ bool TestOptions::parseArgs(llvm::ArrayRef<const char *> Args) {
       isAsyncRequest = true;
       break;
 
+    case OPT_cursor_action:
+      CollectActionables = true;
+      break;
+
+    case OPT_swift_name:
+      SwiftName = InputArg->getValue();
+      break;
+
+    case OPT_objc_name:
+      ObjCName = InputArg->getValue();
+      break;
+
+    case OPT_objc_selector:
+      ObjCSelector = InputArg->getValue();
+      break;
+
+    case OPT_name:
+      Name = InputArg->getValue();
+      break;
+
+    case OPT_cancel_on_subsequent_request:
+      unsigned Cancel;
+      if (StringRef(InputArg->getValue()).getAsInteger(10, Cancel)) {
+        llvm::errs() << "error: expected integer for 'cancel-on-subsequent-request'\n";
+        return true;
+      }
+      CancelOnSubsequentRequest = Cancel;
+      break;
+
     case OPT_UNKNOWN:
       llvm::errs() << "error: unknown argument: "
-                   << InputArg->getAsString(ParsedArgs) << '\n';
+                   << InputArg->getAsString(ParsedArgs) << '\n'
+                   << "Use -h or -help for assistance" << '\n';
       return true;
     }
   }
@@ -264,4 +342,17 @@ bool TestOptions::parseArgs(llvm::ArrayRef<const char *> Args) {
   }
 
   return false;
+}
+
+void TestOptions::printHelp(bool ShowHidden) const {
+
+  // Based off of swift/lib/Driver/Driver.cpp, at Driver::printHelp
+  //FIXME: should we use IncludedFlagsBitmask and ExcludedFlagsBitmask?
+  // Maybe not for modes such as Interactive, Batch, AutolinkExtract, etc,
+  // as in Driver.cpp. But could be useful for extra info, like HelpHidden.
+
+  TestOptTable Table;
+
+  Table.PrintHelp(llvm::outs(), "sourcekitd-test", "SourceKit Testing Tool",
+                      ShowHidden);
 }

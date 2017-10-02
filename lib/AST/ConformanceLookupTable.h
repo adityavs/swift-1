@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -152,6 +152,8 @@ class ConformanceLookupTable {
                  ? ConformanceEntryKind::Synthesized
                  : ConformanceEntryKind::Implied;
       }
+
+      llvm_unreachable("Unhandled ConformanceEntryKind in switch.");
     }
 
     /// For an inherited conformance, retrieve the class declaration
@@ -229,6 +231,8 @@ class ConformanceLookupTable {
       case ConformanceEntryKind::Inherited:
         return true;
       }
+
+      llvm_unreachable("Unhandled ConformanceEntryKind in switch.");
     }
 
     /// Whether this protocol conformance was superseded by another
@@ -360,19 +364,16 @@ class ConformanceLookupTable {
   /// \returns true if any conformance entries were superseded by this
   /// operation.
   bool resolveConformances(NominalTypeDecl *nominal,
-                           ProtocolDecl *protocol,
-                           LazyResolver *resolver);
+                           ProtocolDecl *protocol);
 
   /// Retrieve the declaration context that provides the
   /// (non-inherited) conformance described by the given conformance
   /// entry.
   DeclContext *getConformingContext(NominalTypeDecl *nominal,
-                                    LazyResolver *resolver,
                                     ConformanceEntry *entry);
 
   /// Resolve the given conformance entry to an actual protocol conformance.
   ProtocolConformance *getConformance(NominalTypeDecl *nominal,
-                                      LazyResolver *resolver,
                                       ConformanceEntry *entry);
 
   /// Enumerate each of the unhandled contexts (nominal type
@@ -435,7 +436,8 @@ public:
                                  ProtocolDecl *protocol);
 
   /// Register an externally-supplied protocol conformance.
-  void registerProtocolConformance(ProtocolConformance *conformance);
+  void registerProtocolConformance(ProtocolConformance *conformance,
+                                   bool synthesized = false);
 
   /// Look for conformances to the given protocol.
   ///

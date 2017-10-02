@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 ///
@@ -21,6 +21,7 @@
 #include "swift/AST/Decl.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/PrettyStackTrace.h"
+#include "swift/AST/Types.h"
 #include "swift/Basic/PrimitiveParsing.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Markup/Markup.h"
@@ -108,7 +109,9 @@ static RawComment toRawComment(ASTContext &Context, CharSourceRange Range) {
   unsigned EndOffset = SourceMgr.getLocOffsetInBuffer(Range.getEnd(), BufferID);
   LangOptions FakeLangOpts;
   Lexer L(FakeLangOpts, SourceMgr, BufferID, nullptr, /*InSILMode=*/false,
-          CommentRetentionMode::ReturnAsTokens, Offset, EndOffset);
+          CommentRetentionMode::ReturnAsTokens,
+          TriviaRetentionMode::WithoutTrivia,
+          Offset, EndOffset);
   SmallVector<SingleRawComment, 16> Comments;
   Token Tok;
   while (true) {
@@ -243,4 +246,19 @@ StringRef Decl::getBriefComment() const {
 
   Context.setBriefComment(this, Result);
   return Result;
+}
+
+CharSourceRange RawComment::getCharSourceRange() {
+  if (this->isEmpty()) {
+    return CharSourceRange();
+  }
+
+  auto Start = this->Comments.front().Range.getStart();
+  if (Start.isInvalid()) {
+    return CharSourceRange();
+  }
+  auto End = this->Comments.back().Range.getEnd();
+  auto Length = static_cast<const char *>(End.getOpaquePointerValue()) -
+                static_cast<const char *>(Start.getOpaquePointerValue());
+  return CharSourceRange(Start, Length);
 }

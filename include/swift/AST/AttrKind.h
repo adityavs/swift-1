@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -48,7 +48,7 @@ enum class UnaryOperatorKind : uint8_t {
 /// Access control levels.
 // These are used in diagnostics and with < and similar operations,
 // so please do not reorder existing values.
-enum class Accessibility : uint8_t {
+enum class AccessLevel : uint8_t {
   /// Private access is limited to the current scope.
   Private = 0,
   /// File-private access is limited to the current file.

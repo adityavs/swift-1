@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -49,7 +49,7 @@ namespace {
 static void createRefCountOpForPayload(SILBuilder &Builder, SILInstruction *I,
                                        EnumElementDecl *EnumDecl,
                                        SILValue DefOfEnum = SILValue()) {
-  assert(EnumDecl->hasArgumentType() &&
+  assert(EnumDecl->hasAssociatedValues() &&
          "We assume enumdecl has an argument type");
 
   SILModule &Mod = I->getModule();
@@ -74,16 +74,16 @@ static void createRefCountOpForPayload(SILBuilder &Builder, SILInstruction *I,
   ++NumRefCountOpsSimplified;
 
   // If we have a retain value...
-  if (isa<RetainValueInst>(I)) {
+  if (auto RCI = dyn_cast<RetainValueInst>(I)) {
     // And our payload is refcounted, insert a strong_retain onto the
     // payload.
     if (UEDITy.isReferenceCounted(Mod)) {
-      Builder.createStrongRetain(I->getLoc(), UEDI, Atomicity::Atomic);
+      Builder.createStrongRetain(I->getLoc(), UEDI, RCI->getAtomicity());
       return;
     }
 
     // Otherwise, insert a retain_value on the payload.
-    Builder.createRetainValue(I->getLoc(), UEDI, Atomicity::Atomic);
+    Builder.createRetainValue(I->getLoc(), UEDI, RCI->getAtomicity());
     return;
   }
 
@@ -91,16 +91,17 @@ static void createRefCountOpForPayload(SILBuilder &Builder, SILInstruction *I,
   // payload.
   assert(isa<ReleaseValueInst>(I) && "If I is not a retain value here, it must "
          "be a release value since enums do not have reference semantics.");
+  auto *RCI = cast<ReleaseValueInst>(I);
 
   // If our payload has reference semantics, insert the strong release.
   if (UEDITy.isReferenceCounted(Mod)) {
-    Builder.createStrongRelease(I->getLoc(), UEDI, Atomicity::Atomic);
+    Builder.createStrongRelease(I->getLoc(), UEDI, RCI->getAtomicity());
     return;
   }
 
   // Otherwise if our payload is non-trivial but lacking reference semantics,
   // insert the release_value.
-  Builder.createReleaseValue(I->getLoc(), UEDI, Atomicity::Atomic);
+  Builder.createReleaseValue(I->getLoc(), UEDI, RCI->getAtomicity());
 }
 
 //===----------------------------------------------------------------------===//
@@ -121,13 +122,13 @@ static bool hoistSILArgumentReleaseInst(SILBasicBlock *BB) {
     return false;
 
   // Make sure it is a release on a SILArgument of the current basic block..
-  SILArgument *SA = dyn_cast<SILArgument>(Head->getOperand(0));
+  auto *SA = dyn_cast<SILArgument>(Head->getOperand(0));
   if (!SA || SA->getParent() != BB)
     return false;
 
   // Make sure the release will not be blocked by the terminator instructions
   // Make sure the terminator does not block, nor is a branch with multiple targets.
-  for (auto P : BB->getPreds()) {
+  for (auto P : BB->getPredecessorBlocks()) {
     if (!isa<BranchInst>(P->getTerminator()))
       return false;
   }
@@ -139,7 +140,7 @@ static bool hoistSILArgumentReleaseInst(SILBasicBlock *BB) {
 
   // Ok, we can get all the incoming values and create releases for them.
   unsigned indices = 0;
-  for (auto P : BB->getPreds()) {
+  for (auto P : BB->getPredecessorBlocks()) {
     createDecrementBefore(PredValues[indices++], P->getTerminator());
   }
   // Erase the old instruction.
@@ -152,7 +153,7 @@ static const int SinkSearchWindow = 6;
 
 /// \brief Returns True if we can sink this instruction to another basic block.
 static bool canSinkInstruction(SILInstruction *Inst) {
-  return Inst->use_empty() && !isa<TermInst>(Inst);
+  return !Inst->hasUsesOfAnyResult() && !isa<TermInst>(Inst);
 }
 
 /// \brief Returns true if this instruction is a skip barrier, which means that
@@ -201,9 +202,9 @@ enum OperandRelation {
 static SILValue findValueShallowRoot(const SILValue &In) {
   // If this is a basic block argument with a single caller
   // then we know exactly which value is passed to the argument.
-  if (SILArgument *Arg = dyn_cast<SILArgument>(In)) {
+  if (auto *Arg = dyn_cast<SILArgument>(In)) {
     SILBasicBlock *Parent = Arg->getParent();
-    SILBasicBlock *Pred = Parent->getSinglePredecessor();
+    SILBasicBlock *Pred = Parent->getSinglePredecessorBlock();
     if (!Pred) return In;
 
     // If the terminator is a cast instruction then use the pre-cast value.
@@ -307,28 +308,28 @@ cheaperToPassOperandsAsArguments(SILInstruction *First,
   // This will further enable to sink strong_retain_unowned instructions,
   // which provides more opportunities for the unowned-optimization in
   // LLVMARCOpts.
-  UnownedToRefInst *UTORI1 = dyn_cast<UnownedToRefInst>(First);
-  UnownedToRefInst *UTORI2 = dyn_cast<UnownedToRefInst>(Second);
+  auto *UTORI1 = dyn_cast<UnownedToRefInst>(First);
+  auto *UTORI2 = dyn_cast<UnownedToRefInst>(Second);
   if (UTORI1 && UTORI2) {
     return 0;
   }
 
   // TODO: Add more cases than Struct
-  StructInst *FirstStruct = dyn_cast<StructInst>(First);
-  StructInst *SecondStruct = dyn_cast<StructInst>(Second);
+  auto *FirstStruct = dyn_cast<StructInst>(First);
+  auto *SecondStruct = dyn_cast<StructInst>(Second);
 
   if (!FirstStruct || !SecondStruct)
     return None;
 
-  assert(First->getNumOperands() == Second->getNumOperands() &&
-         First->getType() == Second->getType() &&
+  assert(FirstStruct->getNumOperands() == SecondStruct->getNumOperands() &&
+         FirstStruct->getType() == SecondStruct->getType() &&
          "Types should be identical");
 
   llvm::Optional<unsigned> DifferentOperandIndex;
 
   // Check operands.
   for (unsigned i = 0, e = First->getNumOperands(); i != e; ++i) {
-    if (First->getOperand(i) != Second->getOperand(i)) {
+    if (FirstStruct->getOperand(i) != SecondStruct->getOperand(i)) {
       // Only track one different operand for now
       if (DifferentOperandIndex)
         return None;
@@ -342,7 +343,7 @@ cheaperToPassOperandsAsArguments(SILInstruction *First,
   // Found a different operand, now check to see if its type is something
   // cheap enough to sink.
   // TODO: Sink more than just integers.
-  const auto &ArgTy = First->getOperand(*DifferentOperandIndex)->getType();
+  SILType ArgTy = FirstStruct->getOperand(*DifferentOperandIndex)->getType();
   if (!ArgTy.is<BuiltinIntegerType>())
     return None;
 
@@ -370,7 +371,7 @@ SILValue getArgForBlock(SILBasicBlock *From, SILBasicBlock *To,
 
 // Try to sink values from the Nth argument \p ArgNum.
 static bool sinkLiteralArguments(SILBasicBlock *BB, unsigned ArgNum) {
-  assert(ArgNum < BB->getNumBBArg() && "Invalid argument");
+  assert(ArgNum < BB->getNumArguments() && "Invalid argument");
 
   // Check if the argument passed to the first predecessor is a literal inst.
   SILBasicBlock *FirstPred = *BB->pred_begin();
@@ -380,7 +381,7 @@ static bool sinkLiteralArguments(SILBasicBlock *BB, unsigned ArgNum) {
     return false;
 
   // Check if the Nth argument in all predecessors is identical.
-  for (auto P : BB->getPreds()) {
+  for (auto P : BB->getPredecessorBlocks()) {
     if (P == FirstPred)
       continue;
 
@@ -393,28 +394,29 @@ static bool sinkLiteralArguments(SILBasicBlock *BB, unsigned ArgNum) {
 
   // Replace the use of the argument with the cloned literal.
   auto Cloned = FirstLiteral->clone(&*BB->begin());
-  BB->getBBArg(ArgNum)->replaceAllUsesWith(Cloned);
+  BB->getArgument(ArgNum)->replaceAllUsesWith(Cloned);
 
   return true;
 }
 
 // Try to sink values from the Nth argument \p ArgNum.
 static bool sinkArgument(SILBasicBlock *BB, unsigned ArgNum) {
-  assert(ArgNum < BB->getNumBBArg() && "Invalid argument");
+  assert(ArgNum < BB->getNumArguments() && "Invalid argument");
 
   // Find the first predecessor, the first terminator and the Nth argument.
   SILBasicBlock *FirstPred = *BB->pred_begin();
   TermInst *FirstTerm = FirstPred->getTerminator();
   auto FirstPredArg = FirstTerm->getOperand(ArgNum);
-  SILInstruction *FSI = dyn_cast<SILInstruction>(FirstPredArg);
-
-  // The list of identical instructions.
-  SmallVector<SILValue, 8> Clones;
-  Clones.push_back(FirstPredArg);
+  auto *FSI = dyn_cast<SingleValueInstruction>(FirstPredArg);
+  // TODO: MultiValueInstruction?
 
   // We only move instructions with a single use.
   if (!FSI || !hasOneNonDebugUse(FSI))
     return false;
+
+  // The list of identical instructions.
+  SmallVector<SingleValueInstruction*, 8> Clones;
+  Clones.push_back(FSI);
 
   // Don't move instructions that are sensitive to their location.
   //
@@ -430,7 +432,7 @@ static bool sinkArgument(SILBasicBlock *BB, unsigned ArgNum) {
   llvm::Optional<unsigned> DifferentOperandIndex;
 
   // Check if the Nth argument in all predecessors is identical.
-  for (auto P : BB->getPreds()) {
+  for (auto P : BB->getPredecessorBlocks()) {
     if (P == FirstPred)
       continue;
 
@@ -441,9 +443,18 @@ static bool sinkArgument(SILBasicBlock *BB, unsigned ArgNum) {
 
     // Find the Nth argument passed to BB.
     SILValue Arg = TI->getOperand(ArgNum);
-    SILInstruction *SI = dyn_cast<SILInstruction>(Arg);
-    if (!SI || !hasOneNonDebugUse(SI))
+
+    // If it's not the same basic kind of node, neither isIdenticalTo nor
+    // cheaperToPassOperandsAsArguments will return true.
+    if (Arg->getKind() != FSI->getValueKind())
       return false;
+
+    // Since it's the same kind, Arg must also be a single-value instruction.
+    auto *SI = cast<SingleValueInstruction>(Arg);
+
+    if (!hasOneNonDebugUse(SI))
+      return false;
+
     if (SI->isIdenticalTo(FSI)) {
       Clones.push_back(SI);
       continue;
@@ -464,10 +475,7 @@ static bool sinkArgument(SILBasicBlock *BB, unsigned ArgNum) {
     Clones.push_back(SI);
   }
 
-  if (!FSI)
-    return false;
-
-  auto *Undef = SILUndef::get(FirstPredArg->getType(), BB->getModule());
+  auto *Undef = SILUndef::get(FSI->getType(), BB->getModule());
 
   // Delete the debug info of the instruction that we are about to sink.
   deleteAllDebugUses(FSI);
@@ -479,21 +487,22 @@ static bool sinkArgument(SILBasicBlock *BB, unsigned ArgNum) {
     // The instruction we are lowering has an argument which is different
     // for each predecessor.  We need to sink the instruction, then add
     // arguments for each predecessor.
-    BB->getBBArg(ArgNum)->replaceAllUsesWith(FSI);
+    BB->getArgument(ArgNum)->replaceAllUsesWith(FSI);
 
     const auto &ArgType = FSI->getOperand(*DifferentOperandIndex)->getType();
-    BB->replaceBBArg(ArgNum, ArgType);
+    BB->replacePHIArgument(ArgNum, ArgType, ValueOwnershipKind::Owned);
 
     // Update all branch instructions in the predecessors to pass the new
     // argument to this BB.
     auto CloneIt = Clones.begin();
-    for (auto P : BB->getPreds()) {
+    for (auto P : BB->getPredecessorBlocks()) {
       // Only handle branch or conditional branch instructions.
       TermInst *TI = P->getTerminator();
       assert((isa<BranchInst>(TI) || isa<CondBranchInst>(TI)) &&
              "Branch instruction required");
 
-      SILInstruction *CloneInst = dyn_cast<SILInstruction>(*CloneIt);
+      // TODO: MultiValueInstruction
+      auto *CloneInst = *CloneIt;
       TI->setOperand(ArgNum, CloneInst->getOperand(*DifferentOperandIndex));
       // Now delete the clone as we only needed it operand.
       if (CloneInst != FSI)
@@ -504,14 +513,14 @@ static bool sinkArgument(SILBasicBlock *BB, unsigned ArgNum) {
 
     // The sunk instruction should now read from the argument of the BB it
     // was moved to.
-    FSI->setOperand(*DifferentOperandIndex, BB->getBBArg(ArgNum));
+    FSI->setOperand(*DifferentOperandIndex, BB->getArgument(ArgNum));
     return true;
   }
 
   // Sink one of the copies of the instruction.
-  FirstPredArg->replaceAllUsesWith(Undef);
+  FSI->replaceAllUsesWithUndef();
   FSI->moveBefore(&*BB->begin());
-  BB->getBBArg(ArgNum)->replaceAllUsesWith(FirstPredArg);
+  BB->getArgument(ArgNum)->replaceAllUsesWith(FSI);
 
   // The argument is no longer in use. Replace all incoming inputs with undef
   // and try to delete the instruction.
@@ -532,12 +541,12 @@ static bool sinkArgument(SILBasicBlock *BB, unsigned ArgNum) {
 /// Notice that unlike other sinking methods in this file we do allow sinking
 /// of literals from blocks with multiple successors.
 static bool sinkLiteralsFromPredecessors(SILBasicBlock *BB) {
-  if (BB->pred_empty() || BB->getSinglePredecessor())
+  if (BB->pred_empty() || BB->getSinglePredecessorBlock())
     return false;
 
   // Try to sink values from each of the arguments to the basic block.
   bool Changed = false;
-  for (int i = 0, e = BB->getNumBBArg(); i < e; ++i)
+  for (int i = 0, e = BB->getNumArguments(); i < e; ++i)
     Changed |= sinkLiteralArguments(BB, i);
 
   return Changed;
@@ -545,17 +554,17 @@ static bool sinkLiteralsFromPredecessors(SILBasicBlock *BB) {
 
 /// Try to sink identical arguments coming from multiple predecessors.
 static bool sinkArgumentsFromPredecessors(SILBasicBlock *BB) {
-  if (BB->pred_empty() || BB->getSinglePredecessor())
+  if (BB->pred_empty() || BB->getSinglePredecessorBlock())
     return false;
 
   // This block must be the only successor of all the predecessors.
-  for (auto P : BB->getPreds())
-    if (P->getSingleSuccessor() != BB)
+  for (auto P : BB->getPredecessorBlocks())
+    if (P->getSingleSuccessorBlock() != BB)
       return false;
 
   // Try to sink values from each of the arguments to the basic block.
   bool Changed = false;
-  for (int i = 0, e = BB->getNumBBArg(); i < e; ++i)
+  for (int i = 0, e = BB->getNumArguments(); i < e; ++i)
     Changed |= sinkArgument(BB, i);
 
   return Changed;
@@ -591,8 +600,8 @@ static bool sinkCodeFromPredecessors(SILBasicBlock *BB) {
     return Changed;
 
   // This block must be the only successor of all the predecessors.
-  for (auto P : BB->getPreds())
-    if (P->getSingleSuccessor() != BB)
+  for (auto P : BB->getPredecessorBlocks())
+    if (P->getSingleSuccessorBlock() != BB)
       return Changed;
 
   SILBasicBlock *FirstPred = *BB->pred_begin();
@@ -612,7 +621,7 @@ static bool sinkCodeFromPredecessors(SILBasicBlock *BB) {
   // bb3(%x, %y):
   //   ...
   ValueToBBArgIdxMap valueToArgIdxMap;
-  for (auto P : BB->getPreds()) {
+  for (auto P : BB->getPredecessorBlocks()) {
     if (auto *BI = dyn_cast<BranchInst>(P->getTerminator())) {
       auto Args = BI->getArgs();
       for (size_t idx = 0, size = Args.size(); idx < size; idx++) {
@@ -637,7 +646,7 @@ static bool sinkCodeFromPredecessors(SILBasicBlock *BB) {
       OperandRelation opRelation = NotDeterminedYet;
 
       // For all preds:
-      for (auto P : BB->getPreds()) {
+      for (auto P : BB->getPredecessorBlocks()) {
         if (P == FirstPred)
           continue;
 
@@ -666,12 +675,12 @@ static bool sinkCodeFromPredecessors(SILBasicBlock *BB) {
             ValueInBlock OpInFirstPred(InstToSink->getOperand(idx), FirstPred);
             assert(valueToArgIdxMap.count(OpInFirstPred) != 0);
             int argIdx = valueToArgIdxMap[OpInFirstPred];
-            InstToSink->setOperand(idx, BB->getBBArg(argIdx));
+            InstToSink->setOperand(idx, BB->getArgument(argIdx));
           }
         }
         Changed = true;
         for (auto I : Dups) {
-          I->replaceAllUsesWith(&*InstToSink);
+          I->replaceAllUsesPairwiseWith(&*InstToSink);
           I->eraseFromParent();
           NumSunk++;
         }
@@ -753,7 +762,7 @@ static bool tryToSinkRefCountAcrossSwitch(SwitchEnumInst *Switch,
     EnumElementDecl *Enum = Case.first;
     SILBasicBlock *Succ = Case.second;
     Builder.setInsertionPoint(&*Succ->begin());
-    if (Enum->hasArgumentType())
+    if (Enum->hasAssociatedValues())
       createRefCountOpForPayload(Builder, &*RV, Enum, Switch->getOperand());
   }
 
@@ -839,7 +848,7 @@ static bool tryToSinkRefCountAcrossSelectEnum(CondBranchInst *CondBr,
     EnumElementDecl *Enum = Elts[i];
     SILBasicBlock *Succ = i == 0 ? CondBr->getTrueBB() : CondBr->getFalseBB();
     Builder.setInsertionPoint(&*Succ->begin());
-    if (Enum->hasArgumentType())
+    if (Enum->hasAssociatedValues())
       createRefCountOpForPayload(Builder, &*I, Enum, SEI->getEnumOperand());
   }
 
@@ -887,7 +896,7 @@ static bool sinkIncrementsIntoSwitchRegions(SILBasicBlock *BB, AliasAnalysis *AA
   bool CanSinkToSuccessor = std::none_of(BB->succ_begin(), BB->succ_end(),
     [](const SILSuccessor &S) -> bool {
       SILBasicBlock *SuccBB = S.getBB();
-      return !SuccBB || !SuccBB->getSinglePredecessor();
+      return !SuccBB || !SuccBB->getSinglePredecessorBlock();
   });
 
   SILInstruction *S = BB->getTerminator();
@@ -968,7 +977,7 @@ public:
 
   void clear() { ValueToCaseMap.clear(); }
 
-  bool visitValueBase(ValueBase *V) { return false; }
+  bool visitSILInstruction(SILInstruction *I) { return false; }
 
   bool visitEnumInst(EnumInst *EI) {
     DEBUG(llvm::dbgs() << "    Storing enum into map: " << *EI);
@@ -1076,7 +1085,7 @@ void BBEnumTagDataflowState::handlePredSwitchEnum(SwitchEnumInst *S) {
 
 void BBEnumTagDataflowState::handlePredCondSelectEnum(CondBranchInst *CondBr) {
 
-  SelectEnumInst *EITI = dyn_cast<SelectEnumInst>(CondBr->getCondition());
+  auto *EITI = dyn_cast<SelectEnumInst>(CondBr->getCondition());
   if (!EITI)
     return;
 
@@ -1142,7 +1151,7 @@ initWithFirstPred(BBToDataflowStateMap &BBToStateMap,
   // are tracking with it.
   //
   // TODO: I am writing this too fast. Clean this up later.
-  if (FirstPredBB->getSingleSuccessor()) {
+  if (FirstPredBB->getSingleSuccessorBlock()) {
     for (auto P : ValueToCaseMap.getItems()) {
       if (!P.hasValue())
         continue;
@@ -1266,7 +1275,7 @@ mergePredecessorStates(BBToDataflowStateMap &BBToStateMap) {
 
       // Check if out predecessor has any other successors. If that is true we
       // clear all the state since we cannot hoist safely.
-      if (!PredBB->getSingleSuccessor()) {
+      if (!PredBB->getSingleSuccessorBlock()) {
         EnumToEnumBBCaseListMap.clear();
         DEBUG(llvm::dbgs() << "                Predecessor has other "
               "successors. Clearing BB cast list map.\n");
@@ -1302,7 +1311,7 @@ bool BBEnumTagDataflowState::visitRetainValueInst(RetainValueInst *RVI) {
     return false;
 
   // If we do not have any argument, kill the retain_value.
-  if (!(*FindResult)->second->hasArgumentType()) {
+  if (!(*FindResult)->second->hasAssociatedValues()) {
     RVI->eraseFromParent();
     return true;
   }
@@ -1322,7 +1331,7 @@ bool BBEnumTagDataflowState::visitReleaseValueInst(ReleaseValueInst *RVI) {
     return false;
 
   // If we do not have any argument, just delete the release value.
-  if (!(*FindResult)->second->hasArgumentType()) {
+  if (!(*FindResult)->second->hasAssociatedValues()) {
     RVI->eraseFromParent();
     return true;
   }
@@ -1413,12 +1422,12 @@ BBEnumTagDataflowState::hoistDecrementsIntoSwitchRegions(AliasAnalysis *AA) {
     for (auto P : EnumBBCaseList) {
       // If we don't have an argument for this case, there is nothing to
       // do... continue...
-      if (!P.second->hasArgumentType())
+      if (!P.second->hasAssociatedValues())
         continue;
 
       // Otherwise create the release_value before the terminator of the
       // predecessor.
-      assert(P.first->getSingleSuccessor() &&
+      assert(P.first->getSingleSuccessorBlock() &&
              "Cannot hoist release into BB that has multiple successors");
       SILBuilderWithScope Builder(P.first->getTerminator(), RVI);
       createRefCountOpForPayload(Builder, RVI, P.second);
@@ -1478,7 +1487,7 @@ findRetainsSinkableFromSwitchRegionForEnum(
 
     // If the case does not have an argument type, skip the predecessor since
     // there will not be a retain to sink.
-    if (!Decl->hasArgumentType())
+    if (!Decl->hasAssociatedValues())
       continue;
 
     // Ok, we found a payloaded predecessor. Look backwards through the
@@ -1545,9 +1554,9 @@ sinkIncrementsOutOfSwitchRegions(AliasAnalysis *AA,
     //
     // TODO: Which debug loc should we use here? Using one of the locs from the
     // delete list seems reasonable for now...
-    SILBuilder(getBB()->begin()).createRetainValue(DeleteList[0]->getLoc(),
-                                                   EnumValue,
-                                                   Atomicity::Atomic);
+    SILBuilder Builder(getBB()->begin());
+    Builder.createRetainValue(DeleteList[0]->getLoc(), EnumValue,
+                              cast<RefCountingInst>(DeleteList[0])->getAtomicity());
     for (auto *I : DeleteList)
       I->eraseFromParent();
     ++NumSunk;
@@ -1577,8 +1586,9 @@ static bool processFunction(SILFunction *F, AliasAnalysis *AA,
     BBEnumTagDataflowState &State = BBToStateMap.getRPOState(RPOIdx);
 
     DEBUG(llvm::dbgs() << "    Predecessors (empty if no predecessors):\n");
-    DEBUG(for (SILBasicBlock *Pred : State.getBB()->getPreds()) {
-        llvm::dbgs() << "        BB#" << RPOIdx << "; Ptr: " << Pred << "\n";
+    DEBUG(for (SILBasicBlock *Pred
+               : State.getBB()->getPredecessorBlocks()) {
+      llvm::dbgs() << "        BB#" << RPOIdx << "; Ptr: " << Pred << "\n";
     });
     DEBUG(llvm::dbgs() << "    State Addr: " << &State << "\n");
 
@@ -1647,7 +1657,6 @@ public:
       invalidateAnalysis(SILAnalysis::InvalidationKind::Instructions);
   }
 
-  StringRef getName() override { return "SIL Code Motion"; }
 };
 
 } // end anonymous namespace

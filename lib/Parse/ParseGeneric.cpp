@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -16,6 +16,7 @@
 
 #include "swift/Parse/Parser.h"
 #include "swift/AST/DiagnosticsParse.h"
+#include "swift/Parse/CodeCompletionCallbacks.h"
 #include "swift/Parse/Lexer.h"
 using namespace swift;
 
@@ -71,10 +72,10 @@ Parser::parseGenericParameters(SourceLoc LAngleLoc) {
       ParserResult<TypeRepr> Ty;
       
       if (Tok.isAny(tok::identifier, tok::code_complete, tok::kw_protocol, tok::kw_Any)) {
-        Ty = parseTypeIdentifierOrTypeComposition();
+        Ty = parseType();
       } else if (Tok.is(tok::kw_class)) {
         diagnose(Tok, diag::unexpected_class_constraint);
-        diagnose(Tok, diag::suggest_anyobject, Name)
+        diagnose(Tok, diag::suggest_anyobject)
           .fixItReplace(Tok.getLoc(), "AnyObject");
         consumeToken();
         Invalid = true;
@@ -90,12 +91,13 @@ Parser::parseGenericParameters(SourceLoc LAngleLoc) {
         Inherited.push_back(Ty.get());
     }
 
-    // We always create generic type parameters with a depth of zero.
+    // We always create generic type parameters with an invalid depth.
     // Semantic analysis fills in the depth when it processes the generic
     // parameter list.
-    auto Param = new (Context) GenericTypeParamDecl(CurDeclContext, Name,
-                                                    NameLoc, /*Depth=*/0,
-                                                    GenericParams.size());
+    auto Param = new (Context) GenericTypeParamDecl(
+        CurDeclContext, Name, NameLoc,
+        GenericTypeParamDecl::InvalidDepth,
+        GenericParams.size());
     if (!Inherited.empty())
       Param->setInherited(Context.AllocateCopy(Inherited));
     GenericParams.push_back(Param);
@@ -121,33 +123,21 @@ Parser::parseGenericParameters(SourceLoc LAngleLoc) {
   
   // Parse the closing '>'.
   SourceLoc RAngleLoc;
-  if (!startsWithGreater(Tok)) {
+  if (startsWithGreater(Tok)) {
+    RAngleLoc = consumeStartingGreater();
+  } else {
     if (!Invalid) {
       diagnose(Tok, diag::expected_rangle_generics_param);
       diagnose(LAngleLoc, diag::opening_angle);
-      
       Invalid = true;
     }
-    
+
     // Skip until we hit the '>'.
-    skipUntilGreaterInTypeList();
-    if (startsWithGreater(Tok))
-      RAngleLoc = consumeStartingGreater();
-    else
-      Invalid = true;
-  } else {
-    RAngleLoc = consumeStartingGreater();
+    RAngleLoc = skipUntilGreaterInTypeList();
   }
 
-  if (GenericParams.empty() || Invalid) {
-    // FIXME: We should really return the generic parameter list here,
-    // even if some generic parameters were invalid, since we rely on
-    // decl->setGenericParams() to re-parent the GenericTypeParamDecls
-    // into the right DeclContext.
-    for (auto Param : GenericParams)
-      Param->setInvalid();
+  if (GenericParams.empty())
     return nullptr;
-  }
 
   return makeParserResult(GenericParamList::create(Context, LAngleLoc,
                                                    GenericParams, WhereLoc,
@@ -213,8 +203,13 @@ Parser::diagnoseWhereClauseInGenericParamList(const GenericParamList *
   if (Tok.is(tok::kw_where))
     WhereClauseText << ',';
 
-  auto Diag = diagnose(WhereRangeInsideBrackets.Start,
-                       diag::where_inside_brackets);
+  // For Swift 3, keep this warning. 
+  const auto Message = Context.isSwiftVersion3() 
+                             ? diag::swift3_where_inside_brackets 
+                             : diag::where_inside_brackets;
+
+  auto Diag = diagnose(WhereRangeInsideBrackets.Start, Message);
+
   Diag.fixItRemoveChars(RemoveWhereRange.getStart(),
                         RemoveWhereRange.getEnd());
 
@@ -245,7 +240,8 @@ Parser::diagnoseWhereClauseInGenericParamList(const GenericParamList *
 ParserStatus Parser::parseGenericWhereClause(
                SourceLoc &WhereLoc,
                SmallVectorImpl<RequirementRepr> &Requirements,
-               bool &FirstTypeInComplete) {
+               bool &FirstTypeInComplete,
+               bool AllowLayoutConstraints) {
   ParserStatus Status;
   // Parse the 'where'.
   WhereLoc = consumeToken(tok::kw_where);
@@ -253,12 +249,14 @@ ParserStatus Parser::parseGenericWhereClause(
   do {
     // Parse the leading type-identifier.
     ParserResult<TypeRepr> FirstType = parseTypeIdentifier();
+
+    if (FirstType.hasCodeCompletion()) {
+      Status.setHasCodeCompletion();
+      FirstTypeInComplete = true;
+    }
+
     if (FirstType.isNull()) {
       Status.setIsParseError();
-      if (FirstType.hasCodeCompletion()) {
-        Status.setHasCodeCompletion();
-        FirstTypeInComplete = true;
-      }
       break;
     }
 
@@ -266,19 +264,43 @@ ParserStatus Parser::parseGenericWhereClause(
       // A conformance-requirement.
       SourceLoc ColonLoc = consumeToken();
 
-      // Parse the protocol or composition.
-      ParserResult<TypeRepr> Protocol = parseTypeIdentifierOrTypeComposition();
-      
-      if (Protocol.isNull()) {
-        Status.setIsParseError();
-        if (Protocol.hasCodeCompletion())
-          Status.setHasCodeCompletion();
-        break;
-      }
+      if (Tok.is(tok::identifier) &&
+          getLayoutConstraint(Context.getIdentifier(Tok.getText()), Context)
+              ->isKnownLayout()) {
+        // Parse a layout constraint.
+        auto LayoutName = Context.getIdentifier(Tok.getText());
+        auto LayoutLoc = consumeToken();
+        auto LayoutInfo = parseLayoutConstraint(LayoutName);
+        if (!LayoutInfo->isKnownLayout()) {
+          // There was a bug in the layout constraint.
+          Status.setIsParseError();
+        }
+        auto Layout = LayoutInfo;
+        // Types in SIL mode may contain layout constraints.
+        if (!AllowLayoutConstraints && !isInSILMode()) {
+          diagnose(LayoutLoc,
+                   diag::layout_constraints_only_inside_specialize_attr);
+        } else {
+          // Add the layout requirement.
+          Requirements.push_back(RequirementRepr::getLayoutConstraint(
+              FirstType.get(), ColonLoc,
+              LayoutConstraintLoc(Layout, LayoutLoc)));
+        }
+      } else {
+        // Parse the protocol or composition.
+        ParserResult<TypeRepr> Protocol = parseType();
 
-      // Add the requirement.
-      Requirements.push_back(RequirementRepr::getTypeConstraint(FirstType.get(),
-                                                     ColonLoc, Protocol.get()));
+        if (Protocol.isNull()) {
+          Status.setIsParseError();
+          if (Protocol.hasCodeCompletion())
+            Status.setHasCodeCompletion();
+          break;
+        }
+
+        // Add the requirement.
+        Requirements.push_back(RequirementRepr::getTypeConstraint(
+            FirstType.get(), ColonLoc, Protocol.get()));
+      }
     } else if ((Tok.isAnyOperator() && Tok.getText() == "==") ||
                Tok.is(tok::equal)) {
       // A same-type-requirement
@@ -308,6 +330,9 @@ ParserStatus Parser::parseGenericWhereClause(
     }
     // If there's a comma, keep parsing the list.
   } while (consumeIf(tok::comma));
+
+  if (Requirements.empty())
+    WhereLoc = SourceLoc();
 
   return Status;
 }
@@ -351,3 +376,21 @@ parseFreestandingGenericWhereClause(GenericParamList *&genericParams,
   return ParserStatus();
 }
 
+/// Parse a where clause after a protocol or associated type declaration.
+ParserStatus Parser::parseProtocolOrAssociatedTypeWhereClause(
+    TrailingWhereClause *&trailingWhere, bool isProtocol) {
+  assert(Tok.is(tok::kw_where) && "Shouldn't call this without a where");
+  SourceLoc whereLoc;
+  SmallVector<RequirementRepr, 4> requirements;
+  bool firstTypeInComplete;
+  auto whereStatus =
+      parseGenericWhereClause(whereLoc, requirements, firstTypeInComplete);
+  if (whereStatus.isSuccess()) {
+    trailingWhere =
+        TrailingWhereClause::create(Context, whereLoc, requirements);
+  } else if (whereStatus.hasCodeCompletion()) {
+    return whereStatus;
+  }
+
+  return ParserStatus();
+}

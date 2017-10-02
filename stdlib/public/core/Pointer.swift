@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -22,6 +22,7 @@ public protocol _Pointer {
 }
 
 /// Derive a pointer argument from a convertible pointer type.
+@_inlineable // FIXME(sil-serialize-all)
 @_transparent
 public // COMPILER_INTRINSIC
 func _convertPointerToPointerArgument<
@@ -32,6 +33,7 @@ func _convertPointerToPointerArgument<
 }
 
 /// Derive a pointer argument from the address of an inout parameter.
+@_inlineable // FIXME(sil-serialize-all)
 @_transparent
 public // COMPILER_INTRINSIC
 func _convertInOutToPointerArgument<
@@ -44,6 +46,7 @@ func _convertInOutToPointerArgument<
 ///
 /// This always produces a non-null pointer, even if the array doesn't have any
 /// storage.
+@_inlineable // FIXME(sil-serialize-all)
 @_transparent
 public // COMPILER_INTRINSIC
 func _convertConstArrayToPointerArgument<
@@ -66,6 +69,7 @@ func _convertConstArrayToPointerArgument<
 /// Derive a pointer argument from an inout array parameter.
 ///
 /// This always produces a non-null pointer, even if the array's length is 0.
+@_inlineable // FIXME(sil-serialize-all)
 @_transparent
 public // COMPILER_INTRINSIC
 func _convertMutableArrayToPointerArgument<
@@ -83,6 +87,7 @@ func _convertMutableArrayToPointerArgument<
 }
 
 /// Derive a UTF-8 pointer argument from a value string parameter.
+@_inlineable // FIXME(sil-serialize-all)
 public // COMPILER_INTRINSIC
 func _convertConstStringToUTF8PointerArgument<
   ToPointer : _Pointer

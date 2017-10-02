@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -74,8 +74,7 @@ public:
       TargetTriple = llvm::Triple(llvm::sys::getDefaultTargetTriple());
 
     if (ParsedArgs.hasArg(OPT_UNKNOWN)) {
-      for (const Arg *A : make_range(ParsedArgs.filtered_begin(OPT_UNKNOWN),
-                                     ParsedArgs.filtered_end())) {
+      for (const Arg *A : ParsedArgs.filtered(OPT_UNKNOWN)) {
         Diags.diagnose(SourceLoc(), diag::error_unknown_arg,
                        A->getAsString(ParsedArgs));
       }
@@ -89,8 +88,7 @@ public:
       return 1;
     }
 
-    for (const Arg *A : make_range(ParsedArgs.filtered_begin(OPT_INPUT),
-                                   ParsedArgs.filtered_end())) {
+    for (const Arg *A : ParsedArgs.filtered(OPT_INPUT)) {
       InputFilenames.push_back(A->getValue());
     }
 
@@ -143,9 +141,7 @@ int modulewrap_main(ArrayRef<const char *> Args, const char *Argv0,
   }
 
   // Superficially verify that the input is a swift module file.
-  llvm::BitstreamReader Reader((unsigned char *)(*ErrOrBuf)->getBufferStart(),
-                               (unsigned char *)(*ErrOrBuf)->getBufferEnd());
-  llvm::BitstreamCursor Cursor(Reader);
+  llvm::BitstreamCursor Cursor(ErrOrBuf.get()->getMemBufferRef());
   for (unsigned char Byte : serialization::MODULE_SIGNATURE)
     if (Cursor.AtEndOfStream() || Cursor.Read(8) != Byte) {
       Instance.getDiags().diagnose(SourceLoc(), diag::error_parse_input_file,
@@ -170,9 +166,9 @@ int modulewrap_main(ArrayRef<const char *> Args, const char *Argv0,
   LangOpts.Target = Invocation.getTargetTriple();
   ASTContext ASTCtx(LangOpts, SearchPathOpts, SrcMgr, Instance.getDiags());
   ClangImporterOptions ClangImporterOpts;
-  ASTCtx.addModuleLoader(ClangImporter::create(ASTCtx, ClangImporterOpts),
+  ASTCtx.addModuleLoader(ClangImporter::create(ASTCtx, ClangImporterOpts, ""),
                          true);
-  Module *M = Module::create(ASTCtx.getIdentifier("swiftmodule"), ASTCtx);
+  ModuleDecl *M = ModuleDecl::create(ASTCtx.getIdentifier("swiftmodule"), ASTCtx);
   SILOptions SILOpts;
   std::unique_ptr<SILModule> SM = SILModule::createEmptyModule(M, SILOpts);
   createSwiftModuleObjectFile(*SM, (*ErrOrBuf)->getBuffer(),

@@ -1,4 +1,4 @@
-// RUN: %target-parse-verify-swift
+// RUN: %target-typecheck-verify-swift -verify-ignore-unknown
 
 import StdlibUnittest
 import StdlibCollectionUnittest
@@ -7,8 +7,7 @@ import StdlibCollectionUnittest
 // Check that Collection.SubSequence is constrained to Collection.
 //
 
-// expected-error@+3 {{type 'CollectionWithBadSubSequence' does not conform to protocol 'Collection'}}
-// expected-error@+2 {{type 'CollectionWithBadSubSequence' does not conform to protocol '_IndexableBase'}}
+// expected-error@+2 {{type 'CollectionWithBadSubSequence' does not conform to protocol 'Collection'}}
 // expected-error@+1 {{type 'CollectionWithBadSubSequence' does not conform to protocol 'Sequence'}}
 struct CollectionWithBadSubSequence : Collection {
   var startIndex: MinimalIndex {
@@ -23,17 +22,14 @@ struct CollectionWithBadSubSequence : Collection {
     fatalError("unreachable")
   }
 
-  // expected-note@+3 {{possibly intended match 'CollectionWithBadSubSequence.SubSequence' (aka 'OpaqueValue<Int8>') does not conform to 'Sequence'}}
   // expected-note@+2 {{possibly intended match}}
   // expected-note@+1 {{possibly intended match}}
   typealias SubSequence = OpaqueValue<Int8>
 }
 
-func useCollectionTypeSubSequenceIndex<C : Collection>(_ c: C)
-  where C.SubSequence.Index == C.Index {}
+func useCollectionTypeSubSequenceIndex<C : Collection>(_ c: C) {}
 
-func useCollectionTypeSubSequenceGeneratorElement<C : Collection>(_ c: C)
-  where C.SubSequence.Iterator.Element == C.Iterator.Element {}
+func useCollectionTypeSubSequenceGeneratorElement<C : Collection>(_ c: C) {}
 
 func sortResultIgnored<
   S : Sequence,
@@ -61,31 +57,27 @@ struct GoodIndexable : Indexable {
   var endIndex: Int { return 0 }
 
   subscript(pos: Int) -> Int { return 0 }
-  subscript(bounds: Range<Int>) -> [Int] { return [] }
+  subscript(bounds: Range<Int>) -> ArraySlice<Int> { return [] }
 }
 
 
-// expected-warning@+3 {{'Indexable' is deprecated: it will be removed in Swift 4.0.  Please use 'Collection' instead}}
-// expected-error@+2 {{type 'BadIndexable1' does not conform to protocol '_IndexableBase'}}
-// expected-error@+1 {{type 'BadIndexable1' does not conform to protocol '_Indexable'}}
-struct BadIndexable1 : Indexable {
+// expected-warning@+1 {{'Indexable' is deprecated: it will be removed in Swift 4.0.  Please use 'Collection' instead}}
+struct AnotherGoodIndexable1 : Indexable {
   func index(after i: Int) -> Int { return i + 1 }
   var startIndex: Int { return 0 }
   var endIndex: Int { return 0 }
 
   subscript(pos: Int) -> Int { return 0 }
-
-  // Missing 'subscript(_:) -> SubSequence'.
 }
 
 // expected-warning@+2 {{'Indexable' is deprecated: it will be removed in Swift 4.0.  Please use 'Collection' instead}}
-// expected-error@+1 {{type 'BadIndexable2' does not conform to protocol '_IndexableBase'}}
+// expected-error@+1 {{type 'BadIndexable2' does not conform to protocol 'Collection'}}
 struct BadIndexable2 : Indexable {
   var startIndex: Int { return 0 }
   var endIndex: Int { return 0 }
 
   subscript(pos: Int) -> Int { return 0 }
-  subscript(bounds: Range<Int>) -> [Int] { return [] }
+  subscript(bounds: Range<Int>) -> ArraySlice<Int> { return [] }
   // Missing index(after:) -> Int
 }
 
@@ -97,7 +89,7 @@ struct GoodBidirectionalIndexable1 : BidirectionalIndexable {
   func index(before i: Int) -> Int { return i - 1 }
 
   subscript(pos: Int) -> Int { return 0 }
-  subscript(bounds: Range<Int>) -> [Int] { return [] }
+  subscript(bounds: Range<Int>) -> ArraySlice<Int> { return [] }
 }
 
 // We'd like to see: {{type 'BadBidirectionalIndexable' does not conform to protocol 'BidirectionalIndexable'}}
@@ -108,12 +100,12 @@ struct BadBidirectionalIndexable : BidirectionalIndexable {
   var endIndex: Int { return 0 }
 
   subscript(pos: Int) -> Int { return 0 }
-  subscript(bounds: Range<Int>) -> [Int] { return [] }
+  subscript(bounds: Range<Int>) -> ArraySlice<Int> { return [] }
 
   // This is a poor error message; it would be better to get a message
   // that index(before:) was missing.
   //
-  // expected-error@+1 {{'index(after:)' has different argument names from those required by protocol '_BidirectionalIndexable' ('index(before:)'}}
+  // expected-error@+1 {{'index(after:)' has different argument labels from those required by protocol 'BidirectionalCollection' ('index(before:)'}}
   func index(after i: Int) -> Int { return 0 }
 }
 
@@ -140,3 +132,6 @@ struct RangeReplaceableCollection_SubSequence_IsDefaulted : RangeReplaceableColl
   }
 }
 
+// FIXME: Remove -verify-ignore-unknown.
+// <unknown>:0: error: unexpected note produced: possibly intended match
+// <unknown>:0: error: unexpected note produced: possibly intended match

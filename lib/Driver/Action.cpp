@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -17,12 +17,6 @@
 
 using namespace swift::driver;
 using namespace llvm::opt;
-
-JobAction::~JobAction() {
-  if (getOwnsInputs()) {
-    llvm::DeleteContainerPointers(Inputs);
-  }
-}
 
 const char *Action::getClassName(ActionClass AC) {
   switch (AC) {
@@ -36,6 +30,8 @@ const char *Action::getClassName(ActionClass AC) {
     case REPLJob: return "repl";
     case LinkJob: return "link";
     case GenerateDSYMJob: return "generate-dSYM";
+    case VerifyDebugInfoJob: return "verify-debug-info";
+    case GeneratePCHJob: return "generate-pch";
   }
 
   llvm_unreachable("invalid class");
@@ -62,3 +58,7 @@ void REPLJobAction::anchor() {}
 void LinkJobAction::anchor() {}
 
 void GenerateDSYMJobAction::anchor() {}
+
+void VerifyDebugInfoJobAction::anchor() {}
+
+void GeneratePCHJobAction::anchor() {}

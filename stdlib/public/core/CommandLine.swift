@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -30,6 +30,7 @@ public enum CommandLine {
       =  _swift_stdlib_getUnsafeArgvArgc(&_argc)
 
   /// Access to the raw argc value from C.
+  @_inlineable // FIXME(sil-serialize-all)
   public static var argc: Int32 {
     _ = CommandLine.unsafeArgv // Force evaluation of argv.
     return _argc
@@ -37,6 +38,7 @@ public enum CommandLine {
 
   /// Access to the raw argv value from C. Accessing the argument vector
   /// through this pointer is unsafe.
+  @_inlineable // FIXME(sil-serialize-all)
   public static var unsafeArgv:
     UnsafeMutablePointer<UnsafeMutablePointer<Int8>?> {
     return _unsafeArgv
@@ -47,23 +49,3 @@ public enum CommandLine {
   public static var arguments: [String]
     = (0..<Int(argc)).map { String(cString: _unsafeArgv[$0]!) }
 }
-
-// FIXME(ABI)#25 : Remove this and the entrypoints in SILGen.
-// rdar://problem/19696522
-@_transparent
-public // COMPILER_INTRINSIC
-func _stdlib_didEnterMain(
-  argc: Int32, argv: UnsafeMutablePointer<UnsafeMutablePointer<Int8>?>
-) {
-  // Initialize the CommandLine.argc and CommandLine.unsafeArgv variables with the
-  // values that were passed in to main.
-  CommandLine._argc = Int32(argc)
-  CommandLine._unsafeArgv = argv
-}
-
-// FIXME: Move this to HashedCollections.swift.gyb
-internal class _Box<Wrapped> {
-  internal var _value: Wrapped
-  internal init(_ value: Wrapped) { self._value = value }
-}
-

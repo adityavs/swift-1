@@ -1,6 +1,7 @@
-// RUN: %target-parse-verify-swift
+// RUN: %target-typecheck-verify-swift
 
 @unknown func f0() {} // expected-error{{unknown attribute 'unknown'}}
+@unknown(x,y) func f1() {} // expected-error{{unknown attribute 'unknown'}}
 
 enum binary { 
   case Zero
@@ -84,27 +85,27 @@ struct TestTranspStruct : ProtoWithTransparent{
 struct CannotHaveTransparentStruct {
   func m1() {}
 }
-@_transparent // expected-error{{@_transparent is only supported on struct and enum extensions}} {{1-15=}}
+@_transparent // expected-error{{@_transparent cannot be applied to this declaration}} {{1-15=}}
 extension TestTranspClass {
   func tr1() {}
 }
-@_transparent
+@_transparent // expected-error{{@_transparent cannot be applied to this declaration}} {{1-15=}}
 extension TestTranspStruct {
   func tr1() {}
 }
-@_transparent
+@_transparent // expected-error{{@_transparent cannot be applied to this declaration}} {{1-15=}}
 extension binary {
   func tr1() {}
 }
 
-class transparentOnCalssVar {
+class transparentOnClassVar {
   @_transparent var max: Int { return 0xFF }; // expected-error {{@_transparent is not supported on declarations within classes}} {{3-17=}}
   func blah () {
     var _: Int = max
   }
 };
 
-class transparentOnCalssVar2 {
+class transparentOnClassVar2 {
   var max: Int {
     @_transparent // expected-error {{@_transparent is not supported on declarations within classes}} {{5-19=}}
     get {
@@ -129,7 +130,7 @@ class Ty0 : Class, NonClass {
 
 // Attributes that should be reported by parser as unknown
 // See rdar://19533915
-@__accessibility struct S__accessibility {} // expected-error{{unknown attribute '__accessibility'}}
+@__setterAccess struct S__accessibility {} // expected-error{{unknown attribute '__setterAccess'}}
 @__raw_doc_comment struct S__raw_doc_comment {} // expected-error{{unknown attribute '__raw_doc_comment'}}
 @__objc_bridged struct S__objc_bridged {} // expected-error{{unknown attribute '__objc_bridged'}}
 
@@ -153,21 +154,21 @@ unowned unowned var weak4 : Ty0  // expected-error {{duplicate modifier}}  expec
 unowned weak var weak5 : Ty0 // expected-error {{duplicate modifier}}  expected-note {{modifier already specified here}}
 
 weak
-var weak6 : Int // expected-error {{'weak' may only be applied to class and class-bound protocol types, not 'Int'}}
+var weak6 : Int? // expected-error {{'weak' may only be applied to class and class-bound protocol types, not 'Int'}}
 unowned
 var weak7 : Int // expected-error {{'unowned' may only be applied to class and class-bound protocol types, not 'Int'}}
 weak
 var weak8 : Class? = Ty0()
 unowned var weak9 : Class = Ty0()
 weak
-var weak10 : NonClass = Ty0() // expected-error {{'weak' may not be applied to non-class-bound 'NonClass'; consider adding a protocol conformance that has a class bound}}
+var weak10 : NonClass? = Ty0() // expected-error {{'weak' must not be applied to non-class-bound 'NonClass'; consider adding a protocol conformance that has a class bound}}
 unowned
-var weak11 : NonClass = Ty0() // expected-error {{'unowned' may not be applied to non-class-bound 'NonClass'; consider adding a protocol conformance that has a class bound}}
+var weak11 : NonClass = Ty0() // expected-error {{'unowned' must not be applied to non-class-bound 'NonClass'; consider adding a protocol conformance that has a class bound}}
 
 unowned
-var weak12 : NonClass = Ty0() // expected-error {{'unowned' may not be applied to non-class-bound 'NonClass'; consider adding a protocol conformance that has a class bound}}
+var weak12 : NonClass = Ty0() // expected-error {{'unowned' must not be applied to non-class-bound 'NonClass'; consider adding a protocol conformance that has a class bound}}
 unowned
-var weak13 : NonClass = Ty0() // expected-error {{'unowned' may not be applied to non-class-bound 'NonClass'; consider adding a protocol conformance that has a class bound}}
+var weak13 : NonClass = Ty0() // expected-error {{'unowned' must not be applied to non-class-bound 'NonClass'; consider adding a protocol conformance that has a class bound}}
 
 weak
 var weak14 : Ty0 // expected-error {{'weak' variable should have optional type 'Ty0?'}}
@@ -190,6 +191,16 @@ var func_result_type_attr : () -> @xyz Int  // expected-error {{unknown attribut
 func func_result_attr() -> @xyz Int {       // expected-error {{unknown attribute 'xyz'}}
   return 4
 }
+
+func func_with_unknown_attr1(@unknown(*) x: Int) {} // expected-error {{unknown attribute 'unknown'}}
+func func_with_unknown_attr2(x: @unknown(_) Int) {} // expected-error {{unknown attribute 'unknown'}}
+func func_with_unknown_attr3(x: @unknown(Int) -> Int) {} // expected-error {{unknown attribute 'unknown'}}
+func func_with_unknown_attr4(x: @unknown(Int) throws -> Int) {} // expected-error {{unknown attribute 'unknown'}}
+func func_with_unknown_attr5(x: @unknown (x: Int, y: Int)) {} // expected-error {{unknown attribute 'unknown'}}
+func func_with_unknown_attr6(x: @unknown(x: Int, y: Int)) {} // expected-error {{unknown attribute 'unknown'}} expected-error {{expected parameter type following ':'}}
+func func_with_unknown_attr7(x: @unknown (Int) () -> Int) {} // expected-error {{unknown attribute 'unknown'}} expected-error {{expected ',' separator}} {{47-47=,}} expected-error {{unnamed parameters must be written with the empty name '_'}} {{48-48=_: }}
+
+func func_type_attribute_with_space(x: @convention (c) () -> Int) {} // OK. Known attributes can have space before its paren.
 
 // @thin is not supported except in SIL.
 var thinFunc : @thin () -> () // expected-error {{attribute is not supported}}

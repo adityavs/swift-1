@@ -8,10 +8,12 @@ add_sourcekit_library(SourceKitSwiftLang
   SwiftIndexing.cpp
   SwiftLangSupport.cpp
   SwiftSourceDocInfo.cpp
-  DEPENDS SourceKitCore swiftDriver swiftFrontend swiftClangImporter swiftIndex swiftIDE
-          swiftAST swiftMarkup swiftParse swiftSIL swiftSILGen swiftSILOptimizer
-          swiftSema swiftBasic swiftSerialization
-          swiftOption cmark
+  DEPENDS swift-syntax-generated-headers
+  LINK_LIBS
+    SourceKitCore swiftDriver swiftFrontend swiftClangImporter swiftIDE
+    swiftAST swiftMarkup swiftParse swiftParseSIL swiftSIL swiftSILGen
+    swiftSILOptimizer swiftIRGen swiftSema swiftBasic swiftSerialization
+    swiftSyntax swiftOption libcmark_static
     # Clang dependencies.
       clangIndex
       clangFormat
@@ -38,6 +40,7 @@ add_sourcekit_library(SourceKitSwiftLang
       debuginfodwarf
       instrumentation
       ipo
+      lto
       mc
       mcparser
       option

@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -93,6 +93,7 @@ DECL(EnumCase, Decl)
 CONTEXT_DECL(TopLevelCode, Decl)
 DECL(IfConfig, Decl)
 DECL(PrecedenceGroup, Decl)
+DECL(MissingMember, Decl)
 
 ABSTRACT_DECL(Operator, Decl)
   OPERATOR_DECL(InfixOperator, OperatorDecl)
@@ -107,7 +108,7 @@ ABSTRACT_DECL(Value, Decl)
       VALUE_DECL(AssociatedType, AbstractTypeParamDecl)
       DECL_RANGE(AbstractTypeParam, GenericTypeParam, AssociatedType)
     ABSTRACT_DECL(GenericType, TypeDecl)
-      VALUE_DECL(TypeAlias, GenericTypeDecl)
+      CONTEXT_VALUE_DECL(TypeAlias, GenericTypeDecl)
       ABSTRACT_DECL(NominalType, GenericTypeDecl)
         NOMINAL_TYPE_DECL(Enum, NominalTypeDecl)
         NOMINAL_TYPE_DECL(Struct, NominalTypeDecl)
@@ -120,7 +121,7 @@ ABSTRACT_DECL(Value, Decl)
   ABSTRACT_DECL(AbstractStorage, ValueDecl)
     VALUE_DECL(Var, AbstractStorageDecl)
       VALUE_DECL(Param, VarDecl)
-    VALUE_DECL(Subscript, AbstractStorageDecl)
+    CONTEXT_VALUE_DECL(Subscript, AbstractStorageDecl)
     DECL_RANGE(AbstractStorage, Var, Subscript)
   ABSTRACT_DECL(AbstractFunction, ValueDecl)
     FUNCTION_DECL(Constructor, AbstractFunctionDecl)

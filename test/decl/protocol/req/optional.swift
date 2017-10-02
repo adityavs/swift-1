@@ -1,4 +1,4 @@
-// RUN: %target-parse-verify-swift
+// RUN: %target-typecheck-verify-swift
 
 // -----------------------------------------------------------------------
 // Declaring optional requirements
@@ -204,18 +204,18 @@ func optionalSubscriptExistential(_ t: P1) {
 // -----------------------------------------------------------------------
 
 // optional cannot be used on non-protocol declarations
-optional var optError: Int = 10 // expected-error{{'optional' can only be applied to protocol members}}
+optional var optError: Int = 10 // expected-error{{'optional' can only be applied to protocol members}} {{1-10=}}
 
 optional struct optErrorStruct { // expected-error{{'optional' modifier cannot be applied to this declaration}} {{1-10=}}
-  optional var ivar: Int // expected-error{{'optional' can only be applied to protocol members}}
-  optional func foo() { } // expected-error{{'optional' can only be applied to protocol members}}
+  optional var ivar: Int // expected-error{{'optional' can only be applied to protocol members}} {{3-12=}}
+  optional func foo() { } // expected-error{{'optional' can only be applied to protocol members}} {{3-12=}}
 }
 
 optional class optErrorClass { // expected-error{{'optional' modifier cannot be applied to this declaration}} {{1-10=}}
-  optional var ivar: Int = 0 // expected-error{{'optional' can only be applied to protocol members}}
-  optional func foo() { } // expected-error{{'optional' can only be applied to protocol members}}
+  optional var ivar: Int = 0 // expected-error{{'optional' can only be applied to protocol members}} {{3-12=}}
+  optional func foo() { } // expected-error{{'optional' can only be applied to protocol members}} {{3-12=}}
 }
-  
+
 protocol optErrorProtocol {
   optional func foo(_ x: Int) // expected-error{{'optional' can only be applied to members of an @objc protocol}}
 }
@@ -224,6 +224,7 @@ protocol optErrorProtocol {
   optional func foo(_ x: Int) // expected-error{{'optional' requirements are an Objective-C compatibility feature; add '@objc'}}{{3-3=@objc }}
   optional var bar: Int { get } // expected-error{{'optional' requirements are an Objective-C compatibility feature; add '@objc'}}{{3-3=@objc }}
   optional associatedtype Assoc  // expected-error{{'optional' modifier cannot be applied to this declaration}} {{3-12=}}
+  // expected-error@-1 {{associated type 'Assoc' cannot be declared inside '@objc' protocol 'optObjcAttributeProtocol'}}
 }
 
 @objc protocol optionalInitProto {

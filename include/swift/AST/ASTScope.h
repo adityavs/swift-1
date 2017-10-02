@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -36,7 +36,6 @@ class ClosureExpr;
 class Decl;
 class DoCatchStmt;
 class Expr;
-class ForStmt;
 class ForEachStmt;
 class GenericParamList;
 class GuardStmt;
@@ -109,11 +108,6 @@ enum class ASTScopeKind : uint8_t {
   SwitchStmt,
   /// Describes a 'case' statement.
   CaseStmt,
-  /// Describes a C-style 'for' statement.
-  ForStmt,
-  /// Describes the scope of variables introduced in the initializer of a
-  /// a C-style 'for' statement.
-  ForStmtInitializer,
   /// Scope for the accessors of an abstract storage declaration.
   Accessors,
   /// Scope for a closure.
@@ -295,10 +289,6 @@ class ASTScope {
     /// A case statement, for \c kind == ASTScopeKind::CaseStmt;
     CaseStmt *caseStmt;
 
-    /// A for statement, for \c kind == ASTScopeKind::ForStmt or
-    /// \c kind == ASTScopeKind::ForStmtInitializer.
-    ForStmt *forStmt;
-
     /// An abstract storage declaration, for
     /// \c kind == ASTScopeKind::Accessors.
     AbstractStorageDecl *abstractStorageDecl;
@@ -456,13 +446,6 @@ class ASTScope {
   ASTScope(const ASTScope *parent, CaseStmt *caseStmt)
       : ASTScope(ASTScopeKind::CaseStmt, parent) {
     this->caseStmt = caseStmt;
-  }
-
-  ASTScope(ASTScopeKind kind, const ASTScope *parent, ForStmt *forStmt)
-      : ASTScope(kind, parent) {
-    assert(kind == ASTScopeKind::ForStmt ||
-           kind == ASTScopeKind::ForStmtInitializer);
-    this->forStmt = forStmt;
   }
 
   ASTScope(const ASTScope *parent, AbstractStorageDecl *abstractStorageDecl)

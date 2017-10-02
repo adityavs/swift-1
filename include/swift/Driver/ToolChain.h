@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -122,6 +122,12 @@ protected:
   constructInvocation(const GenerateDSYMJobAction &job,
                       const JobContext &context) const;
   virtual InvocationInfo
+  constructInvocation(const VerifyDebugInfoJobAction &job,
+                      const JobContext &context) const;
+  virtual InvocationInfo
+  constructInvocation(const GeneratePCHJobAction &job,
+                      const JobContext &context) const;
+  virtual InvocationInfo
   constructInvocation(const AutolinkExtractJobAction &job,
                       const JobContext &context) const;
   virtual InvocationInfo
@@ -156,12 +162,20 @@ public:
   std::unique_ptr<Job> constructJob(const JobAction &JA,
                                     Compilation &C,
                                     SmallVectorImpl<const Job *> &&inputs,
-                                    const ActionList &inputActions,
+                                    ArrayRef<const Action *> inputActions,
                                     std::unique_ptr<CommandOutput> output,
                                     const OutputInfo &OI) const;
 
   /// Return the default language type to use for the given extension.
   virtual types::ID lookupTypeForExtension(StringRef Ext) const;
+
+  /// Check whether a clang library with a given name exists.
+  ///
+  /// \param args Invocation arguments.
+  /// \param sanitizer Sanitizer name.
+  virtual bool sanitizerRuntimeLibExists(const llvm::opt::ArgList &args,
+                                         StringRef sanitizer) const;
+
 };
 } // end namespace driver
 } // end namespace swift

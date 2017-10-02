@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -96,6 +96,30 @@ ValueDecl *deriveBridgedNSError(TypeChecker &tc,
                                 NominalTypeDecl *type,
                                 ValueDecl *requirement);
 
+/// Derive a CodingKey requirement for an enum type.
+///
+/// \returns the derived member, which will also be added to the type.
+ValueDecl *deriveCodingKey(TypeChecker &tc,
+                           Decl *parentDecl,
+                           NominalTypeDecl *type,
+                           ValueDecl *requirement);
+
+/// Derive an Encodable requirement for a struct type.
+///
+/// \returns the derived member, which will also be added to the type.
+ValueDecl *deriveEncodable(TypeChecker &tc,
+                           Decl *parentDecl,
+                           NominalTypeDecl *type,
+                           ValueDecl *requirement);
+
+/// Derive a Decodable requirement for a struct type.
+///
+/// \returns the derived member, which will also be added to the type.
+ValueDecl *deriveDecodable(TypeChecker &tc,
+                           Decl *parentDecl,
+                           NominalTypeDecl *type,
+                           ValueDecl *requirement);
+
 /// Declare a getter for a derived property.
 FuncDecl *declareDerivedPropertyGetter(TypeChecker &tc,
                                        Decl *parentDecl,
@@ -120,6 +144,9 @@ declareDerivedReadOnlyProperty(TypeChecker &tc,
 
 /// Build a reference to the 'self' decl of a derived function.
 DeclRefExpr *createSelfDeclRef(AbstractFunctionDecl *fn);
+
+/// Copy access from the source decl to the destination decl.
+void copyFormalAccess(ValueDecl *dest, ValueDecl *source);
 
 }
   

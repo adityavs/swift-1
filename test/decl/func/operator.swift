@@ -1,4 +1,4 @@
-// RUN: %target-parse-verify-swift
+// RUN: %target-typecheck-verify-swift
 
 infix operator %%%
 infix operator %%%%
@@ -62,7 +62,7 @@ prefix func +// this should be a comment, not an operator
 prefix func -/* this also should be a comment, not an operator */
 (arg: Int) -> Int { return arg }
 
-func +*/ () {}   // expected-error {{expected identifier in function declaration}} expected-error {{unexpected end of block comment}} expected-error {{braced block of statements is an unused closure}} expected-error{{begin with a closure}} expected-note{{discard the result}} {{13-13=_ = }} expected-error{{expression resolves to an unused function}}
+func +*/ () {}   // expected-error {{expected identifier in function declaration}} expected-error {{unexpected end of block comment}} expected-error {{closure expression is unused}} expected-error{{top-level statement cannot begin with a closure expression}} expected-note{{did you mean to use a 'do' statement?}} {{13-13=do }}
 func errors() {
   */    // expected-error {{unexpected end of block comment}}
   
@@ -148,8 +148,8 @@ postfix prefix infix func ++(x: Double) {} // expected-error {{'prefix' contradi
 infix prefix func +-+(x: Int, y: Int) {} // expected-error {{'infix' modifier is not required or allowed on func declarations}} {{1-7=}} expected-error{{'prefix' contradicts previous modifier 'infix'}} {{7-14=}}
 
 // Don't allow one to define a postfix '!'; it's built into the
-// language.
-postfix operator!  // expected-error {{cannot declare a custom postfix '!' operator}}
+// language. Also illegal to have any postfix operator starting with '!'.
+postfix operator !  // expected-error {{cannot declare a custom postfix '!' operator}} expected-error {{expected operator name in operator declaration}}
 prefix operator &  // expected-error {{cannot declare a custom prefix '&' operator}}
 
 // <rdar://problem/14607026> Restrict use of '<' and '>' as prefix/postfix operator names
@@ -190,13 +190,13 @@ _ = n☃⃠☃⃠n     // expected-error {{ambiguous missing whitespace between 
 // expected-note @-1 {{could be binary '☃⃠' and prefix '☃⃠'}} {{12-12= }} {{18-18= }}
 // expected-note @-2 {{could be postfix '☃⃠' and binary '☃⃠'}} {{6-6= }} {{12-12= }}
 
-_ = n☃⃠☃⃠ // expected-error {{unary operators may not be juxtaposed; parenthesize inner expression}}
-_ = ~!n  // expected-error {{unary operators may not be juxtaposed; parenthesize inner expression}}
-_ = -+n  // expected-error {{unary operators may not be juxtaposed; parenthesize inner expression}}
-_ = -++n // expected-error {{unary operators may not be juxtaposed; parenthesize inner expression}}
+_ = n☃⃠☃⃠ // expected-error {{unary operators must not be juxtaposed; parenthesize inner expression}}
+_ = ~!n  // expected-error {{unary operators must not be juxtaposed; parenthesize inner expression}}
+_ = -+n  // expected-error {{unary operators must not be juxtaposed; parenthesize inner expression}}
+_ = -++n // expected-error {{unary operators must not be juxtaposed; parenthesize inner expression}}
 
 // <rdar://problem/16230507> Cannot use a negative constant as the second operator of ... operator
-_ = 3...-5  // expected-error {{missing whitespace between '...' and '-' operators}}
+_ = 3...-5  // expected-error {{ambiguous missing whitespace between unary and binary operators}} expected-note {{could be postfix '...' and binary '-'}} expected-note {{could be binary '...' and prefix '-'}}
 
 
 protocol P0 {
@@ -228,7 +228,7 @@ class C0 {
 }
 
 class C1 {
-  final func %%%(lhs: C1, rhs: C1) -> C1 { return lhs }
+  final func %%%(lhs: C1, rhs: C1) -> C1 { return lhs } // expected-error{{operator '%%%' declared in type 'C1' must be 'static'}}{{3-3=static }}
 }
 
 final class C2 {

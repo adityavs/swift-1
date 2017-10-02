@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -51,10 +51,8 @@ public:
 
   /// If the given ValueBase is a SILInstruction add it to the worklist.
   void addValue(ValueBase *V) {
-    auto *I = dyn_cast<SILInstruction>(V);
-    if (!I)
-      return;
-    add(I);
+    if (auto *I = V->getDefiningInstruction())
+      add(I);
   }
 
   /// Add the given list of instructions in reverse order to the worklist. This
@@ -82,11 +80,20 @@ public:
   }
 
   /// When an instruction has been simplified, add all of its users to the
-  /// worklist since additional simplifications of its users may have been
+  /// worklist, since additional simplifications of its users may have been
   /// exposed.
   void addUsersToWorklist(ValueBase *I) {
     for (auto UI : I->getUses())
       add(UI->getUser());
+  }
+
+  /// When an instruction has been simplified, add all of its users to the
+  /// worklist, since additional simplifications of its users may have been
+  /// exposed.
+  void addUsersOfAllResultsToWorklist(SILInstruction *I) {
+    for (auto result : I->getResults()) {
+      addUsersToWorklist(result);
+    }
   }
 
   /// Check that the worklist is empty and nuke the backing store for the map if
@@ -130,7 +137,7 @@ public:
       : AA(AA), Worklist(), MadeChange(false), RemoveCondFails(removeCondFails),
         Iteration(0), Builder(B),
         CastOpt(/* ReplaceInstUsesAction */
-                [&](SILInstruction *I, ValueBase * V) {
+                [&](SingleValueInstruction *I, ValueBase * V) {
                   replaceInstUsesWith(*I, V);
                 },
                 /* EraseAction */
@@ -152,7 +159,9 @@ public:
   // replaceable with another preexisting expression. Here we add all uses of I
   // to the worklist, replace all uses of I with the new value, then return I,
   // so that the combiner will know that I was modified.
-  SILInstruction *replaceInstUsesWith(SILInstruction &I, ValueBase *V);
+  void replaceInstUsesWith(SingleValueInstruction &I, ValueBase *V);
+
+  void replaceInstUsesPairwiseWith(SILInstruction *oldI, SILInstruction *newI);
 
   // Some instructions can never be "trivially dead" due to side effects or
   // producing a void value. In those cases, since we cannot rely on
@@ -175,11 +184,13 @@ public:
   }
 
   /// Base visitor that does not do anything.
-  SILInstruction *visitValueBase(ValueBase *V) { return nullptr; }
+  SILInstruction *visitSILInstruction(SILInstruction *I) { return nullptr; }
 
   /// Instruction visitors.
   SILInstruction *visitReleaseValueInst(ReleaseValueInst *DI);
   SILInstruction *visitRetainValueInst(RetainValueInst *CI);
+  SILInstruction *visitReleaseValueAddrInst(ReleaseValueAddrInst *DI);
+  SILInstruction *visitRetainValueAddrInst(RetainValueAddrInst *CI);
   SILInstruction *visitPartialApplyInst(PartialApplyInst *AI);
   SILInstruction *visitApplyInst(ApplyInst *AI);
   SILInstruction *visitTryApplyInst(TryApplyInst *AI);
@@ -190,6 +201,7 @@ public:
   SILInstruction *visitUpcastInst(UpcastInst *UCI);
   SILInstruction *visitLoadInst(LoadInst *LI);
   SILInstruction *visitAllocStackInst(AllocStackInst *AS);
+  SILInstruction *visitAllocRefInst(AllocRefInst *AR);
   SILInstruction *visitSwitchEnumAddrInst(SwitchEnumAddrInst *SEAI);
   SILInstruction *visitInjectEnumAddrInst(InjectEnumAddrInst *IEAI);
   SILInstruction *visitPointerToAddressInst(PointerToAddressInst *PTAI);
@@ -226,10 +238,16 @@ public:
   SILInstruction *visitAllocRefDynamicInst(AllocRefDynamicInst *ARDI);
   SILInstruction *visitEnumInst(EnumInst *EI);
   SILInstruction *visitConvertFunctionInst(ConvertFunctionInst *CFI);
-  SILInstruction *visitWitnessMethodInst(WitnessMethodInst *WMI);
 
   /// Instruction visitor helpers.
   SILInstruction *optimizeBuiltinCanBeObjCClass(BuiltinInst *AI);
+
+  // Optimize the "trunc_N1_M2" builtin. if N1 is a result of "zext_M1_*" and
+  // the following holds true: N1 > M1 and M2>= M1
+  SILInstruction *optimizeBuiltinTruncOrBitCast(BuiltinInst *I);
+
+  // Optimize the "zext_M2_M3" builtin. if M2 is a result of "zext_M1_M2"
+  SILInstruction *optimizeBuiltinZextOrBitCast(BuiltinInst *I);
 
   // Optimize the "cmp_eq_XXX" builtin. If \p NegateResult is true then negate
   // the result bit.
@@ -254,7 +272,7 @@ private:
                                                CanType ConcreteType,
                                                SILValue ConcreteTypeDef,
                                                ProtocolConformanceRef Conformance,
-                                               CanType OpenedArchetype);
+                                               ArchetypeType *OpenedArchetype);
   SILInstruction *
   propagateConcreteTypeOfInitExistential(FullApplySite AI,
       ProtocolDecl *Protocol,
@@ -280,7 +298,8 @@ private:
 
   /// Erases an apply instruction including all it's uses \p.
   /// Inserts release/destroy instructions for all owner and in-parameters.
-  void eraseApply(FullApplySite FAS, const UserListTy &Users);
+  /// \return Returns true if successful.
+  bool eraseApply(FullApplySite FAS, const UserListTy &Users);
 
   /// Returns true if the results of a try_apply are not used.
   static bool isTryApplyResultNotUsed(UserListTy &AcceptedUses,

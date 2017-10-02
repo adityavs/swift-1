@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -47,7 +47,7 @@ public struct PrefixThroughTest {
   public let position: Int
   public let expected: [Int]
   public let loc: SourceLoc
-  
+
   init(
     collection: [Int], position: Int, expected: [Int],
     file: String = #file, line: UInt = #line
@@ -120,85 +120,85 @@ public let subscriptRangeTests = [
 
   // Slice to the full extent.
   SubscriptRangeTest(
-    expected: [ 1010 ],
-    collection: [ 1010 ],
+    expected: [1010],
+    collection: [1010],
     bounds: 0..<1,
     count: 1),
   SubscriptRangeTest(
-    expected: [ 1010, 2020, 3030 ],
-    collection: [ 1010, 2020, 3030 ],
+    expected: [1010, 2020, 3030],
+    collection: [1010, 2020, 3030],
     bounds: 0..<3,
     count: 3),
   SubscriptRangeTest(
-    expected: [ 1010, 2020, 3030, 4040, 5050 ],
-    collection: [ 1010, 2020, 3030, 4040, 5050 ],
+    expected: [1010, 2020, 3030, 4040, 5050],
+    collection: [1010, 2020, 3030, 4040, 5050],
     bounds: 0..<5,
     count: 5),
 
   // Slice an empty prefix.
   SubscriptRangeTest(
     expected: [],
-    collection: [ 1010, 2020, 3030 ],
+    collection: [1010, 2020, 3030],
     bounds: 0..<0,
     count: 3),
 
   // Slice a prefix.
   SubscriptRangeTest(
-    expected: [ 1010, 2020 ],
-    collection: [ 1010, 2020, 3030 ],
+    expected: [1010, 2020],
+    collection: [1010, 2020, 3030],
     bounds: 0..<2,
     count: 3),
   SubscriptRangeTest(
-    expected: [ 1010, 2020 ],
-    collection: [ 1010, 2020, 3030, 4040, 5050 ],
+    expected: [1010, 2020],
+    collection: [1010, 2020, 3030, 4040, 5050],
     bounds: 0..<2,
     count: 5),
-  
+
   // Slice an empty suffix.
   SubscriptRangeTest(
     expected: [],
-    collection: [ 1010, 2020, 3030 ],
+    collection: [1010, 2020, 3030],
     bounds: 3..<3,
     count: 3),
 
   // Slice a suffix.
   SubscriptRangeTest(
-    expected: [ 2020, 3030 ],
-    collection: [ 1010, 2020, 3030 ],
+    expected: [2020, 3030],
+    collection: [1010, 2020, 3030],
     bounds: 1..<3,
     count: 3),
   SubscriptRangeTest(
-    expected: [ 4040, 5050 ],
-    collection: [ 1010, 2020, 3030, 4040, 5050 ],
+    expected: [4040, 5050],
+    collection: [1010, 2020, 3030, 4040, 5050],
     bounds: 3..<5,
     count: 5),
 
   // Slice an empty range in the middle.
   SubscriptRangeTest(
     expected: [],
-    collection: [ 1010, 2020, 3030 ],
+    collection: [1010, 2020, 3030],
     bounds: 1..<1,
     count: 3),
   SubscriptRangeTest(
     expected: [],
-    collection: [ 1010, 2020, 3030 ],
+    collection: [1010, 2020, 3030],
     bounds: 2..<2,
     count: 3),
 
   // Slice the middle part.
   SubscriptRangeTest(
-    expected: [ 2020 ],
-    collection: [ 1010, 2020, 3030 ],
+    expected: [2020],
+    collection: [1010, 2020, 3030],
     bounds: 1..<2,
     count: 3),
   SubscriptRangeTest(
-    expected: [ 3030 ],
-    collection: [ 1010, 2020, 3030, 4040 ],
-    bounds: 3..<4,
+    expected: [3030],
+    collection: [1010, 2020, 3030, 4040],
+    bounds: 2..<3,
     count: 4),
   SubscriptRangeTest(
-    expected: [ 2020, 3030, 4040 ],
-    collection: [ 1010, 2020, 3030, 4040, 5050, 6060 ],
+    expected: [2020, 3030, 4040],
+    collection: [1010, 2020, 3030, 4040, 5050, 6060],
     bounds: 1..<4,
     count: 6),
 ]
@@ -332,7 +332,7 @@ public struct IndexOffsetByTest {
   public let distance: Int
   public let limit: Int?
   public let expectedOffset: Int?
-  
+
   public let loc: SourceLoc
 
   public init(
@@ -404,7 +404,7 @@ public struct IndexAfterTest {
   public init(start: Int, end: Int, file: String = #file, line: UInt = #line) {
     self.start = start
     self.end = end
-    self.loc = SourceLoc(file, line, 
+    self.loc = SourceLoc(file, line,
       comment: "index(after:) and formIndex(after:) test data")
   }
 }
@@ -471,21 +471,9 @@ internal enum _SubSequenceSubscriptOnRangeMode {
 %{
   from gyb_stdlib_support import collectionForTraversal
   def testConstraints(protocol):
-    return '''    
+    return '''
     C : %(protocol)s,
     CollectionWithEquatableElement : %(protocol)s,
-    CollectionWithEquatableElement.SubSequence : Collection,
-    CollectionWithEquatableElement.SubSequence.Iterator.Element
-      == CollectionWithEquatableElement.Iterator.Element,
-    C.SubSequence : %(protocol)s,
-    C.SubSequence.Iterator.Element == C.Iterator.Element,
-    C.SubSequence.Index == C.Index,
-    C.SubSequence.Indices.Iterator.Element == C.Index,
-    C.SubSequence.SubSequence == C.SubSequence,
-    C.Indices : %(protocol)s,
-    C.Indices.Iterator.Element == C.Index,
-    C.Indices.Index == C.Index,
-    C.Indices.SubSequence == C.Indices,
     CollectionWithEquatableElement.Iterator.Element : Equatable
   ''' % locals()
 
@@ -502,21 +490,20 @@ internal enum _SubSequenceSubscriptOnRangeMode {
     wrapValueIntoEquatable: @escaping (
       MinimalEquatableValue) -> CollectionWithEquatableElement.Iterator.Element,
 
-    extractValueFromEquatable: @escaping (
-      CollectionWithEquatableElement.Iterator.Element) -> MinimalEquatableValue,
+    extractValueFromEquatable: @escaping ((CollectionWithEquatableElement.Iterator.Element) -> MinimalEquatableValue),
 
     resiliencyChecks: CollectionMisuseResiliencyChecks = .all,
     outOfBoundsIndexOffset: Int = 1,
-    outOfBoundsSubscriptOffset: Int = 1, 
+    outOfBoundsSubscriptOffset: Int = 1,
     collectionIsBidirectional: Bool
   '''
-  
+
   import re
   forwardTestArgs = ',\n    '.join(
     [ x.group(1) + ': ' + x.group(1)
       for x in re.finditer(r'([a-zA-Z0-9_]+):', testParams) ]
   ).replace('testNamePrefix: ', '\n    ')
-}% 
+}%
 extension TestSuite {
   public func addCollectionTests<
     C, CollectionWithEquatableElement
@@ -687,8 +674,8 @@ extension TestSuite {
         // TODO: swift-3-indexing-model: uncomment the following.
         // FIXME: improve checkForwardCollection to check the SubSequence type.
         checkCollection(
-          slice,
           expected: test.expected.map(wrapValue),
+          slice,
           resiliencyChecks: .none) {
           extractValue($0).value == extractValue($1).value
         }
@@ -1047,7 +1034,7 @@ extension TestSuite {
     self.test("\(testNamePrefix).removeFirst()/slice/semantics") {
       for test in removeFirstTests.filter({ $0.numberToRemove == 1 }) {
         let c = makeWrappedCollection(test.collection.map(OpaqueValue.init))
-        var slice = c[c.startIndex..<c.endIndex]
+        var slice = c[...]
         let survivingIndices = _allIndices(
           into: slice,
           in: slice.index(after: slice.startIndex)..<slice.endIndex)
@@ -1087,7 +1074,7 @@ extension TestSuite {
     self.test("\(testNamePrefix).removeFirst(n: Int)/slice/semantics") {
       for test in removeFirstTests {
         let c = makeWrappedCollection(test.collection.map(OpaqueValue.init))
-        var slice = c[c.startIndex..<c.endIndex]
+        var slice = c[...]
         let survivingIndices = _allIndices(
           into: slice,
           in: slice.index(
@@ -1146,7 +1133,7 @@ extension TestSuite {
       // This can just reuse the test data for removeFirst()
       for test in removeFirstTests.filter({ $0.numberToRemove == 1 }) {
         let c = makeWrappedCollection(test.collection.map(OpaqueValue.init))
-        var slice = c[c.startIndex..<c.endIndex]
+        var slice = c[...]
         let survivingIndices = _allIndices(
           into: slice,
           in: slice.index(after: slice.startIndex)..<slice.endIndex)
@@ -1209,7 +1196,7 @@ extension TestSuite {
     //          index(before: of i: Index) -> Index
     //          formIndex(before: i: inout Index)
 
-    // FIXME: swift-3-indexing-model - 
+    // FIXME: swift-3-indexing-model -
     //   enhance the following for negative direction?
     //          advance(i: Index, by n: IndexDistance) -> Index
     //          advance(
@@ -1242,7 +1229,7 @@ extension TestSuite {
     self.test("\(testNamePrefix).removeLast()/slice/semantics") {
       for test in removeLastTests.filter({ $0.numberToRemove == 1 }) {
         let c = makeWrappedCollection(test.collection)
-        var slice = c[c.startIndex..<c.endIndex]
+        var slice = c[...]
         let survivingIndices = _allIndices(
             into: slice,
           in: slice.startIndex
@@ -1287,7 +1274,7 @@ extension TestSuite {
     self.test("\(testNamePrefix).removeLast(n: Int)/slice/semantics") {
       for test in removeLastTests {
         let c = makeWrappedCollection(test.collection)
-        var slice = c[c.startIndex..<c.endIndex]
+        var slice = c[...]
         let survivingIndices = _allIndices(
           into: slice,
           in: slice.startIndex
@@ -1348,7 +1335,7 @@ extension TestSuite {
       // This can just reuse the test data for removeLast()
       for test in removeLastTests.filter({ $0.numberToRemove == 1 }) {
         let c = makeWrappedCollection(test.collection)
-        var slice = c[c.startIndex..<c.endIndex]
+        var slice = c[...]
         let survivingIndices = _allIndices(
           into: slice,
           in: slice.startIndex
@@ -1516,7 +1503,7 @@ extension TestSuite {
     }
 
     addBidirectionalCollectionTests(${forwardTestArgs})
-    
+
     testNamePrefix += String(describing: C.Type.self)
 
     func makeWrappedCollection(_ elements: [OpaqueValue<Int>]) -> C {

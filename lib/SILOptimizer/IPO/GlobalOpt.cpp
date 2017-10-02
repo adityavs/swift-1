@@ -2,16 +2,16 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
 #define DEBUG_TYPE "globalopt"
-#include "swift/Basic/DemangleWrappers.h"
+#include "swift/Demangling/Demangle.h"
 #include "swift/SIL/CFG.h"
 #include "swift/SIL/DebugUtils.h"
 #include "swift/SIL/SILInstruction.h"
@@ -20,11 +20,13 @@
 #include "swift/SILOptimizer/PassManager/Passes.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
 #include "swift/SILOptimizer/Utils/Local.h"
+#include "swift/Demangling/Demangler.h"
+#include "swift/Demangling/ManglingMacros.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SCCIterator.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
-#include "swift/AST/Mangle.h"
+#include "swift/AST/ASTMangler.h"
 using namespace swift;
 
 namespace {
@@ -72,13 +74,17 @@ class SILGlobalOpt {
   // Keep track of cold blocks.
   ColdBlockInfo ColdBlocks;
 
+  NominalTypeDecl *ArrayDecl;
+  int GlobIdx = 0;
+
   // Whether we see a "once" call to callees that we currently don't handle.
   bool UnhandledOnceCallee = false;
   // Record number of times a globalinit_func is called by "once".
   llvm::DenseMap<SILFunction*, unsigned> InitializerCount;
 public:
-  SILGlobalOpt(SILModule *M, DominanceAnalysis *DA): Module(M), DA(DA),
-                                                     ColdBlocks(DA) {}
+  SILGlobalOpt(SILModule *M, DominanceAnalysis *DA)
+      : Module(M), DA(DA), ColdBlocks(DA),
+        ArrayDecl(M->getASTContext().getArrayDecl()) {}
 
   bool run();
 
@@ -87,6 +93,24 @@ protected:
   void collectGlobalLoad(LoadInst *SI, SILGlobalVariable *SILG);
   void collectGlobalStore(StoreInst *SI, SILGlobalVariable *SILG);
   void collectGlobalAccess(GlobalAddrInst *GAI);
+
+  bool isCOWType(SILType type) {
+    return type.getNominalOrBoundGenericNominal() == ArrayDecl;
+  }
+
+  bool isValidUseOfObject(SILInstruction *Val, bool isCOWObject,
+                          ApplyInst **FindStringCall = nullptr);
+
+  bool getObjectInitVals(SILValue Val,
+                         llvm::DenseMap<VarDecl *, StoreInst *> &MemberStores,
+                         llvm::SmallVectorImpl<StoreInst *> &TailStores,
+                         ApplyInst **FindStringCall);
+  bool handleTailAddr(int TailIdx, SILInstruction *I,
+                      llvm::SmallVectorImpl<StoreInst *> &TailStores);
+
+  void optimizeObjectAllocation(AllocRefInst *ARI);
+  void replaceFindStringCall(ApplyInst *FindStringCall);
+
   SILGlobalVariable *getVariableOfGlobalInit(SILFunction *AddrF);
   bool isInLoop(SILBasicBlock *CurBB);
   void placeInitializers(SILFunction *InitF, ArrayRef<ApplyInst*> Calls);
@@ -103,13 +127,14 @@ protected:
                                 SILFunction *AddrF,
                                 SILFunction *InitF,
                                 SILGlobalVariable *SILG,
+                                SingleValueInstruction *InitVal,
                                 GlobalInitCalls &Calls);
 };
 
 /// Helper class to copy only a set of SIL instructions providing in the
 /// constructor.
 class InstructionsCloner : public SILClonerWithScopes<InstructionsCloner> {
-  friend class SILVisitor<InstructionsCloner>;
+  friend class SILInstructionVisitor<InstructionsCloner>;
   friend class SILCloner<InstructionsCloner>;
 
   ArrayRef<SILInstruction *> Insns;
@@ -137,7 +162,10 @@ class InstructionsCloner : public SILClonerWithScopes<InstructionsCloner> {
   void postProcess(SILInstruction *Orig, SILInstruction *Cloned) {
     DestBB->push_back(Cloned);
     SILClonerWithScopes<InstructionsCloner>::postProcess(Orig, Cloned);
-    AvailVals.push_back(std::make_pair(Orig, Cloned));
+    auto origResults = Orig->getResults(), clonedResults = Cloned->getResults();
+    assert(origResults.size() == clonedResults.size());
+    for (auto i : indices(origResults))
+      AvailVals.push_back(std::make_pair(origResults[i], clonedResults[i]));
   }
 
   // Clone all instructions from Insns into DestBB
@@ -147,7 +175,7 @@ class InstructionsCloner : public SILClonerWithScopes<InstructionsCloner> {
   }
 };
 
-} // namespace
+} // end anonymous namespace
 
 /// If this is a call to a global initializer, map it.
 void SILGlobalOpt::collectGlobalInitCall(ApplyInst *AI) {
@@ -176,7 +204,7 @@ static void removeToken(SILValue Op) {
       ATPI->eraseFromParent();
   }
 
-  if (GlobalAddrInst *GAI = dyn_cast<GlobalAddrInst>(Op)) {
+  if (auto *GAI = dyn_cast<GlobalAddrInst>(Op)) {
     auto *Global = GAI->getReferencedGlobal();
     // If "global_addr token" is used more than one time, bail.
     if (!(GAI->use_empty() || GAI->hasOneUse()))
@@ -190,15 +218,17 @@ static void removeToken(SILValue Op) {
   }
 }
 
+static std::string mangleGetter(VarDecl *varDecl) {
+  Mangle::ASTMangler Mangler;
+  return Mangler.mangleGlobalGetterEntity(varDecl);
+}
+
 /// Generate getter from the initialization code whose
 /// result is stored by a given store instruction.
 static SILFunction *genGetterFromInit(StoreInst *Store,
                                       SILGlobalVariable *SILG) {
   auto *varDecl = SILG->getDecl();
-
-  Mangle::Mangler getterMangler;
-  getterMangler.mangleGlobalGetterEntity(varDecl);
-  auto getterName = getterMangler.finalize();
+  auto getterName = mangleGetter(varDecl);
 
   // Check if a getter was generated already.
   if (auto *F = Store->getModule().lookUpFunction(getterName))
@@ -212,7 +242,7 @@ static SILFunction *genGetterFromInit(StoreInst *Store,
   SmallVector<SILInstruction *, 8> ReverseInsns;
   SmallVector<SILInstruction *, 8> Insns;
   ReverseInsns.push_back(Store);
-  ReverseInsns.push_back(dyn_cast<SILInstruction>(Store->getDest()));
+  ReverseInsns.push_back(dyn_cast<SingleValueInstruction>(Store->getDest()));
   if (!analyzeStaticInitializer(V, ReverseInsns))
     return nullptr;
 
@@ -222,7 +252,7 @@ static SILFunction *genGetterFromInit(StoreInst *Store,
   }
 
   // Generate a getter from the global init function without side-effects.
-  auto refType = varDecl->getType().getCanonicalTypeOrNull();
+  auto refType = varDecl->getInterfaceType()->getCanonicalType();
   // Function takes no arguments and returns refType
   SILResultInfo Results[] = { SILResultInfo(refType, ResultConvention::Owned) };
   SILFunctionType::ExtInfo EInfo;
@@ -230,11 +260,14 @@ static SILFunction *genGetterFromInit(StoreInst *Store,
   auto LoweredType = SILFunctionType::get(nullptr, EInfo,
       ParameterConvention::Direct_Owned, { }, Results, None,
       Store->getModule().getASTContext());
-  auto *GetterF = Store->getModule().getOrCreateFunction(Store->getLoc(),
-      getterName, SILLinkage::PrivateExternal, LoweredType,
+  auto *GetterF = Store->getModule().getOrCreateFunction(
+      Store->getLoc(),
+      getterName, SILLinkage::Private, LoweredType,
       IsBare_t::IsBare, IsTransparent_t::IsNotTransparent,
-      IsFragile_t::IsFragile);
+      IsSerialized_t::IsSerialized);
   GetterF->setDebugScope(Store->getFunction()->getDebugScope());
+  if (Store->getFunction()->hasUnqualifiedOwnership())
+    GetterF->setUnqualifiedOwnership();
   auto *EntryBB = GetterF->createBasicBlock();
   // Copy instructions into GetterF
   InstructionsCloner Cloner(*GetterF, Insns, EntryBB);
@@ -251,7 +284,7 @@ static SILFunction *genGetterFromInit(StoreInst *Store,
       I.eraseFromParent();
       continue;
     }
-    if (StoreInst *SI = dyn_cast<StoreInst>(&I)) {
+    if (auto *SI = dyn_cast<StoreInst>(&I)) {
       Val = SI->getSrc();
       SILBuilderWithScope B(SI);
       B.createReturn(SI->getLoc(), Val);
@@ -284,8 +317,8 @@ static SILFunction *getCalleeOfOnceCall(BuiltinInst *BI) {
   assert(BI->getNumOperands() == 2 && "once call should have 2 operands.");
 
   auto Callee = BI->getOperand(1);
-  assert(cast<SILFunctionType>(Callee->getType().getSwiftRValueType())
-                 ->getRepresentation() == SILFunctionTypeRepresentation::Thin &&
+  assert(Callee->getType().castTo<SILFunctionType>()->getRepresentation()
+           == SILFunctionTypeRepresentation::Thin &&
          "Expected thin function representation!");
 
   if (auto *FR = dyn_cast<FunctionRefInst>(Callee))
@@ -343,11 +376,11 @@ bool SILGlobalOpt::isInLoop(SILBasicBlock *CurBB) {
 /// Returns true if the block \p BB is terminated with a cond_br based on an
 /// availability check.
 static bool isAvailabilityCheck(SILBasicBlock *BB) {
-  CondBranchInst *CBR = dyn_cast<CondBranchInst>(BB->getTerminator());
+  auto *CBR = dyn_cast<CondBranchInst>(BB->getTerminator());
   if (!CBR)
     return false;
   
-  ApplyInst *AI = dyn_cast<ApplyInst>(CBR->getCondition());
+  auto *AI = dyn_cast<ApplyInst>(CBR->getCondition());
   if (!AI)
     return false;
 
@@ -386,7 +419,7 @@ static bool isAvailabilityCheckOnDomPath(SILBasicBlock *From, SILBasicBlock *To,
 void SILGlobalOpt::placeInitializers(SILFunction *InitF,
                                      ArrayRef<ApplyInst*> Calls) {
   DEBUG(llvm::dbgs() << "GlobalOpt: calls to "
-        << demangle_wrappers::demangleSymbolAsString(InitF->getName())
+        << Demangle::demangleSymbolAsString(InitF->getName())
         << " : " << Calls.size() << "\n");
   // Map each initializer-containing function to its final initializer call.
   llvm::DenseMap<SILFunction*, ApplyInst*> ParentFuncs;
@@ -467,15 +500,13 @@ void SILGlobalOpt::placeInitializers(SILFunction *InitF,
 static SILFunction *genGetterFromInit(SILFunction *InitF, VarDecl *varDecl) {
   // Generate a getter from the global init function without side-effects.
 
-  Mangle::Mangler getterMangler;
-  getterMangler.mangleGlobalGetterEntity(varDecl);
-  auto getterName = getterMangler.finalize();
+  auto getterName = mangleGetter(varDecl);
 
   // Check if a getter was generated already.
   if (auto *F = InitF->getModule().lookUpFunction(getterName))
     return F;
 
-  auto refType = varDecl->getType().getCanonicalTypeOrNull();
+  auto refType = varDecl->getInterfaceType()->getCanonicalType();
   // Function takes no arguments and returns refType
   SILResultInfo Results[] = { SILResultInfo(refType, ResultConvention::Owned) };
   SILFunctionType::ExtInfo EInfo;
@@ -483,10 +514,13 @@ static SILFunction *genGetterFromInit(SILFunction *InitF, VarDecl *varDecl) {
   auto LoweredType = SILFunctionType::get(nullptr, EInfo,
       ParameterConvention::Direct_Owned, { }, Results, None,
       InitF->getASTContext());
-  auto *GetterF = InitF->getModule().getOrCreateFunction(InitF->getLocation(),
-     getterName, SILLinkage::PrivateExternal, LoweredType,
+  auto *GetterF = InitF->getModule().getOrCreateFunction(
+      InitF->getLocation(),
+      getterName, SILLinkage::Private, LoweredType,
       IsBare_t::IsBare, IsTransparent_t::IsNotTransparent,
-      IsFragile_t::IsFragile);
+      IsSerialized_t::IsSerialized);
+  if (InitF->hasUnqualifiedOwnership())
+    GetterF->setUnqualifiedOwnership();
 
   auto *EntryBB = GetterF->createBasicBlock();
   // Copy InitF into GetterF
@@ -505,13 +539,13 @@ static SILFunction *genGetterFromInit(SILFunction *InitF, VarDecl *varDecl) {
       continue;
     }
 
-    if (StoreInst *SI = dyn_cast<StoreInst>(&I)) {
+    if (auto *SI = dyn_cast<StoreInst>(&I)) {
       Val = SI->getSrc();
       Store = SI;
       continue;
     }
 
-    if (ReturnInst *RI = dyn_cast<ReturnInst>(&I)) {
+    if (auto *RI = dyn_cast<ReturnInst>(&I)) {
       SILBuilderWithScope B(RI);
       B.createReturn(RI->getLoc(), Val);
       eraseUsesOfInstruction(RI);
@@ -536,7 +570,7 @@ static SILFunction *findInitializer(SILModule *Module, SILFunction *AddrF,
   SILBasicBlock *BB = &AddrF->front();
   for (auto &I : *BB) {
     // Find the builtin "once" call.
-    if (BuiltinInst *BI = dyn_cast<BuiltinInst>(&I)) {
+    if (auto *BI = dyn_cast<BuiltinInst>(&I)) {
       const BuiltinInfo &Builtin = Module->getBuiltinInfo(BI->getName());
       if (Builtin.ID != BuiltinValueKind::Once)
         continue;
@@ -568,43 +602,174 @@ static bool isAssignedOnlyOnceInInitializer(SILGlobalVariable *SILG) {
 /// a chain of struct_element_addr followed by a load.
 /// The sequence is traversed starting from the load
 /// instruction.
-static SILInstruction *convertLoadSequence(SILInstruction *I,
-                                SILInstruction *Value,
-                                SILBuilder &B) {
+static SILValue convertLoadSequence(SILValue oldSequence,
+                                    SILValue newRootValue,
+                                    SILBuilder &B) {
 
-  if (isa<GlobalAddrInst>(I))
-    return Value;
+  if (isa<GlobalAddrInst>(oldSequence))
+    return newRootValue;
 
-  if (auto *LI = dyn_cast<LoadInst>(I)) {
-    Value =
-        convertLoadSequence(cast<SILInstruction>(LI->getOperand()), Value, B);
-    LI->replaceAllUsesWith(Value);
-    return Value;
+  if (auto *LI = dyn_cast<LoadInst>(oldSequence)) {
+    auto newValue = convertLoadSequence(LI->getOperand(), newRootValue, B);
+    LI->replaceAllUsesWith(newValue);
+    return newValue;
   }
 
   // It is a series of struct_element_addr followed by load.
-  if (auto *SEAI = dyn_cast<StructElementAddrInst>(I)) {
-    Value =
-        convertLoadSequence(cast<SILInstruction>(SEAI->getOperand()), Value, B);
-    auto *SEI = B.createStructExtract(SEAI->getLoc(), Value, SEAI->getField());
-    return SEI;
+  if (auto *SEAI = dyn_cast<StructElementAddrInst>(oldSequence)) {
+    auto newValue = convertLoadSequence(SEAI->getOperand(), newRootValue, B);
+    newValue = B.createStructExtract(SEAI->getLoc(), newValue, SEAI->getField());
+    return newValue;
   }
 
-  if (auto *TEAI = dyn_cast<TupleElementAddrInst>(I)) {
-    Value =
-        convertLoadSequence(cast<SILInstruction>(TEAI->getOperand()), Value, B);
-    auto *TEI = B.createTupleExtract(TEAI->getLoc(), Value, TEAI->getFieldNo());
-    return TEI;
+  if (auto *TEAI = dyn_cast<TupleElementAddrInst>(oldSequence)) {
+    auto newValue = convertLoadSequence(TEAI->getOperand(), newRootValue, B);
+    newValue = B.createTupleExtract(TEAI->getLoc(), newValue, TEAI->getFieldNo());
+    return newValue;
   }
 
   llvm_unreachable("Unknown instruction sequence for reading from a global");
   return nullptr;
 }
 
+static SILGlobalVariable *getVariableOfStaticInitializer(SILFunction *InitFunc,
+                                             SingleValueInstruction *&InitVal) {
+  InitVal = nullptr;
+  SILGlobalVariable *GVar = nullptr;
+  // We only handle a single SILBasicBlock for now.
+  if (InitFunc->size() != 1)
+    return nullptr;
+
+  SILBasicBlock *BB = &InitFunc->front();
+  GlobalAddrInst *SGA = nullptr;
+  bool HasStore = false;
+  for (auto &I : *BB) {
+    // Make sure we have a single GlobalAddrInst and a single StoreInst.
+    // And the StoreInst writes to the GlobalAddrInst.
+    if (isa<AllocGlobalInst>(&I) || isa<ReturnInst>(&I)
+        || isa<DebugValueInst>(&I)) {
+      continue;
+    } else if (auto *sga = dyn_cast<GlobalAddrInst>(&I)) {
+      if (SGA)
+        return nullptr;
+      SGA = sga;
+      GVar = SGA->getReferencedGlobal();
+    } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
+      if (HasStore || SI->getDest() != SGA)
+        return nullptr;
+      HasStore = true;
+      SILValue value = SI->getSrc();
+
+      // We only handle StructInst and TupleInst being stored to a
+      // global variable for now.
+      if (!isa<StructInst>(value) && !isa<TupleInst>(value))
+        return nullptr;
+      InitVal = cast<SingleValueInstruction>(value);
+    } else if (!SILGlobalVariable::isValidStaticInitializerInst(&I,
+                                                             I.getModule())) {
+      return nullptr;
+    }
+  }
+  if (!InitVal)
+    return nullptr;
+  return GVar;
+}
+
+namespace {
+
+/// Utility class for cloning init values into the static initializer of a
+/// SILGlobalVariable.
+class StaticInitCloner : public SILCloner<StaticInitCloner> {
+  friend class SILInstructionVisitor<StaticInitCloner>;
+  friend class SILCloner<StaticInitCloner>;
+
+  /// The number of not yet cloned operands for each instruction.
+  llvm::DenseMap<SILInstruction *, int> NumOpsToClone;
+
+  /// List of instructions for which all operands are already cloned (or which
+  /// don't have any operands).
+  llvm::SmallVector<SILInstruction *, 8> ReadyToClone;
+
+public:
+  StaticInitCloner(SILGlobalVariable *GVar)
+      : SILCloner<StaticInitCloner>(GVar) { }
+
+  /// Add \p InitVal and all its operands (transitively) for cloning.
+  ///
+  /// Note: all init values must are added, before calling clone().
+  void add(SILInstruction *InitVal);
+
+  /// Clone \p InitVal and all its operands into the initializer of the
+  /// SILGlobalVariable.
+  ///
+  /// \return Returns the cloned instruction in the SILGlobalVariable.
+  SingleValueInstruction *clone(SingleValueInstruction *InitVal);
+
+  /// Convenience function to clone a single \p InitVal.
+  static void appendToInitializer(SILGlobalVariable *GVar,
+                                  SingleValueInstruction *InitVal) {
+    StaticInitCloner Cloner(GVar);
+    Cloner.add(InitVal);
+    Cloner.clone(InitVal);
+  }
+
+protected:
+  SILLocation remapLocation(SILLocation Loc) {
+    return ArtificialUnreachableLocation();
+  }
+};
+
+void StaticInitCloner::add(SILInstruction *InitVal) {
+  // Don't schedule an instruction twice for cloning.
+  if (NumOpsToClone.count(InitVal) != 0)
+    return;
+
+  ArrayRef<Operand> Ops = InitVal->getAllOperands();
+  NumOpsToClone[InitVal] = Ops.size();
+  if (Ops.empty()) {
+    // It's an instruction without operands, e.g. a literal. It's ready to be
+    // cloned first.
+    ReadyToClone.push_back(InitVal);
+  } else {
+    // Recursively add all operands.
+    for (const Operand &Op : Ops) {
+      add(cast<SingleValueInstruction>(Op.get()));
+    }
+  }
+}
+
+SingleValueInstruction *
+StaticInitCloner::clone(SingleValueInstruction *InitVal) {
+  assert(NumOpsToClone.count(InitVal) != 0 && "InitVal was not added");
+  // Find the right order to clone: all operands of an instruction must be
+  // cloned before the instruction itself.
+  while (!ReadyToClone.empty()) {
+    SILInstruction *I = ReadyToClone.pop_back_val();
+
+    // Clone the instruction into the SILGlobalVariable
+    visit(I);
+
+    // Check if users of I can now be cloned.
+    for (SILValue result : I->getResults()) {
+      for (Operand *Use : result->getUses()) {
+        SILInstruction *User = Use->getUser();
+        if (NumOpsToClone.count(User) != 0 && --NumOpsToClone[User] == 0)
+          ReadyToClone.push_back(User);
+      }
+    }
+  }
+  assert(ValueMap.count(InitVal) != 0 &&
+         "Could not schedule all instructions for cloning");
+  return cast<SingleValueInstruction>(ValueMap[InitVal]);
+}
+
+} // end anonymous namespace
+
 /// Replace loads from a global variable by the known value.
 void SILGlobalOpt::
 replaceLoadsByKnownValue(BuiltinInst *CallToOnce, SILFunction *AddrF,
                          SILFunction *InitF, SILGlobalVariable *SILG,
+                         SingleValueInstruction *InitVal,
                          GlobalInitCalls &Calls) {
   assert(isAssignedOnlyOnceInInitializer(SILG) &&
          "The value of the initializer should be known at compile-time");
@@ -666,7 +831,7 @@ replaceLoadsByKnownValue(BuiltinInst *CallToOnce, SILFunction *AddrF,
   }
 
   Calls.clear();
-  SILG->setInitializer(InitF);
+  StaticInitCloner::appendToInitializer(SILG, InitVal);
 }
 
 /// We analyze the body of globalinit_func to see if it can be statically
@@ -689,8 +854,9 @@ void SILGlobalOpt::optimizeInitializer(SILFunction *AddrF,
     return;
 
   // If the globalinit_func is trivial, continue; otherwise bail.
-  auto *SILG = SILGlobalVariable::getVariableOfStaticInitializer(InitF);
-  if (!SILG || !SILG->isDefinition())
+  SingleValueInstruction *InitVal;
+  SILGlobalVariable *SILG = getVariableOfStaticInitializer(InitF, InitVal);
+  if (!SILG)
     return;
 
   DEBUG(llvm::dbgs() << "GlobalOpt: use static initializer for " <<
@@ -700,12 +866,12 @@ void SILGlobalOpt::optimizeInitializer(SILFunction *AddrF,
   if (!isAssignedOnlyOnceInInitializer(SILG) || !SILG->getDecl()) {
     removeToken(CallToOnce->getOperand(0));
     CallToOnce->eraseFromParent();
-    SILG->setInitializer(InitF);
+    StaticInitCloner::appendToInitializer(SILG, InitVal);
     HasChanged = true;
     return;
   }
 
-  replaceLoadsByKnownValue(CallToOnce, AddrF, InitF, SILG, Calls);
+  replaceLoadsByKnownValue(CallToOnce, AddrF, InitF, SILG, InitVal, Calls);
   HasChanged = true;
 }
 
@@ -722,7 +888,8 @@ SILGlobalVariable *SILGlobalOpt::getVariableOfGlobalInit(SILFunction *AddrF) {
       return nullptr;
 
     // If the globalinit_func is trivial, continue; otherwise bail.
-    auto *SILG = SILGlobalVariable::getVariableOfStaticInitializer(InitF);
+    SingleValueInstruction *dummyInitVal;
+    auto *SILG = getVariableOfStaticInitializer(InitF, dummyInitVal);
     if (!SILG || !SILG->isDefinition())
       return nullptr;
 
@@ -741,13 +908,13 @@ static bool canBeChangedExternally(SILGlobalVariable *SILG) {
   // if possible.
   if (auto *Decl = SILG->getDecl()) {
     switch (Decl->getEffectiveAccess()) {
-    case Accessibility::Private:
-    case Accessibility::FilePrivate:
+    case AccessLevel::Private:
+    case AccessLevel::FilePrivate:
       return false;
-    case Accessibility::Internal:
+    case AccessLevel::Internal:
       return !SILG->getModule().isWholeModule();
-    case Accessibility::Public:
-    case Accessibility::Open:
+    case AccessLevel::Public:
+    case AccessLevel::Open:
       return true;
     }
   }
@@ -766,7 +933,7 @@ static bool canBeChangedExternally(SILGlobalVariable *SILG) {
 /// Check if instruction I is a load from instruction V or
 /// or a struct_element_addr from instruction V.
 /// returns instruction I if this condition holds, or nullptr otherwise.
-static LoadInst *getValidLoad(SILInstruction *I, SILInstruction *V) {
+static LoadInst *getValidLoad(SILInstruction *I, SILValue V) {
   if (auto *LI = dyn_cast<LoadInst>(I)) {
     if (LI->getOperand() == V)
       return LI;
@@ -836,6 +1003,406 @@ void SILGlobalOpt::collectGlobalAccess(GlobalAddrInst *GAI) {
   }
 }
 
+/// Get all stored properties of a class, including it's super classes.
+static void getFields(ClassDecl *Cl, SmallVectorImpl<VarDecl *> &Fields) {
+  if (ClassDecl *SuperCl = Cl->getSuperclassDecl()) {
+    getFields(SuperCl, Fields);
+  }
+  for (VarDecl *Field : Cl->getStoredProperties()) {
+    Fields.push_back(Field);
+  }
+}
+
+/// Check if \p V is a valid instruction for a static initializer, including
+/// all its operands.
+static bool isValidInitVal(SILValue V) {
+  if (auto I = dyn_cast<SingleValueInstruction>(V)) {
+    if (!SILGlobalVariable::isValidStaticInitializerInst(I, I->getModule()))
+      return false;
+
+    for (Operand &Op : I->getAllOperands()) {
+      if (!isValidInitVal(Op.get()))
+        return false;
+    }
+    return true;
+  }
+  return false;
+}
+
+/// Check if \p V is an empty tuple or empty struct.
+static bool isEmptyInitVal(SILValue V) {
+  if (!isa<StructInst>(V) && !isa<TupleInst>(V))
+    return false;
+
+  // If any of the operands is not empty, the whole struct/tuple is not empty.
+  for (Operand &Op : cast<SingleValueInstruction>(V)->getAllOperands()) {
+    if (!isEmptyInitVal(Op.get()))
+      return false;
+  }
+  return true;
+}
+
+/// Check if a use of an object may prevent outlining the object.
+///
+/// If \p isCOWObject is true, then the object reference is wrapped into a
+/// COW container. Currently this is just Array<T>.
+/// If a use is a call to the findStringSwitchCase semantic call, the apply
+/// is returned in \p FindStringCall.
+bool SILGlobalOpt::isValidUseOfObject(SILInstruction *I, bool isCOWObject,
+                                      ApplyInst **FindStringCall) {
+  switch (I->getKind()) {
+  case SILInstructionKind::DebugValueAddrInst:
+  case SILInstructionKind::DebugValueInst:
+  case SILInstructionKind::LoadInst:
+  case SILInstructionKind::DeallocRefInst:
+  case SILInstructionKind::StrongRetainInst:
+  case SILInstructionKind::StrongReleaseInst:
+    return true;
+
+  case SILInstructionKind::ReturnInst:
+  case SILInstructionKind::TryApplyInst:
+  case SILInstructionKind::PartialApplyInst:
+  case SILInstructionKind::StoreInst:
+    /// We don't have a representation for COW objects in SIL, so we do some
+    /// ad-hoc testing: We can ignore uses of a COW object if any use after
+    /// this will do a uniqueness checking before the object is modified.
+    return isCOWObject;
+
+  case SILInstructionKind::ApplyInst:
+    if (!isCOWObject)
+      return false;
+    // There should only be a single call to findStringSwitchCase. But even
+    // if there are multiple calls, it's not problem - we'll just optimize the
+    // last one we find.
+    if (cast<ApplyInst>(I)->hasSemantics("findStringSwitchCase"))
+      *FindStringCall = cast<ApplyInst>(I);
+    return true;
+
+  case SILInstructionKind::StructInst:
+    if (isCOWType(cast<StructInst>(I)->getType())) {
+      // The object is wrapped into a COW container.
+      isCOWObject = true;
+    }
+    break;
+
+  case SILInstructionKind::UncheckedRefCastInst:
+  case SILInstructionKind::StructElementAddrInst:
+  case SILInstructionKind::AddressToPointerInst:
+    assert(!isCOWObject && "instruction cannot have a COW object as operand");
+    break;
+
+  case SILInstructionKind::TupleInst:
+  case SILInstructionKind::TupleExtractInst:
+  case SILInstructionKind::EnumInst:
+    break;
+
+  case SILInstructionKind::StructExtractInst:
+    // To be on the safe side we don't consider the object as COW if it is
+    // extracted again from the COW container: the uniqueness check may be
+    // optimized away in this case.
+    isCOWObject = false;
+    break;
+
+  case SILInstructionKind::BuiltinInst: {
+    // Handle the case for comparing addresses. This occurs when the Array
+    // comparison function is inlined.
+    auto *BI = cast<BuiltinInst>(I);
+    BuiltinValueKind K = BI->getBuiltinInfo().ID;
+    if (K == BuiltinValueKind::ICMP_EQ || K == BuiltinValueKind::ICMP_NE)
+      return true;
+    return false;
+  }
+
+  default:
+    return false;
+  }
+
+  auto SVI = cast<SingleValueInstruction>(I);
+  for (Operand *Use : getNonDebugUses(SVI)) {
+    if (!isValidUseOfObject(Use->getUser(), isCOWObject, FindStringCall))
+      return false;
+  }
+  return true;
+}
+
+/// Handle the address of a tail element.
+bool SILGlobalOpt::handleTailAddr(int TailIdx, SILInstruction *TailAddr,
+                              llvm::SmallVectorImpl<StoreInst *> &TailStores) {
+  if (TailIdx >= 0 && TailIdx < (int)TailStores.size()) {
+    if (auto *SI = dyn_cast<StoreInst>(TailAddr)) {
+      if (!isValidInitVal(SI->getSrc()) || TailStores[TailIdx])
+        return false;
+      // We don't optimize arrays with an empty element type. This would
+      // generate a wrong initializer with zero-sized elements. But the stride
+      // of zero sized types is (artificially) set to 1 in IRGen.
+      if (isEmptyInitVal(SI->getSrc()))
+        return false;
+      TailStores[TailIdx] = SI;
+      return true;
+    }
+  }
+  return isValidUseOfObject(TailAddr, /*isCOWObject*/false);
+}
+
+/// Get the init values for an object's stored properties and its tail elements.
+bool SILGlobalOpt::getObjectInitVals(SILValue Val,
+                        llvm::DenseMap<VarDecl *, StoreInst *> &MemberStores,
+                        llvm::SmallVectorImpl<StoreInst *> &TailStores,
+                        ApplyInst **FindStringCall) {
+  for (Operand *Use : Val->getUses()) {
+    SILInstruction *User = Use->getUser();
+    if (auto *UC = dyn_cast<UpcastInst>(User)) {
+      // Upcast is transparent.
+      if (!getObjectInitVals(UC, MemberStores, TailStores, FindStringCall))
+        return false;
+    } else if (auto *REA = dyn_cast<RefElementAddrInst>(User)) {
+      // The address of a stored property.
+      for (Operand *ElemAddrUse : REA->getUses()) {
+        SILInstruction *ElemAddrUser = ElemAddrUse->getUser();
+        if (auto *SI = dyn_cast<StoreInst>(ElemAddrUser)) {
+          if (!isValidInitVal(SI->getSrc()) || MemberStores[REA->getField()])
+            return false;
+          MemberStores[REA->getField()] = SI;
+        } else if (!isValidUseOfObject(ElemAddrUser, /*isCOWObject*/false)) {
+          return false;
+        }
+      }
+    } else if (auto *RTA = dyn_cast<RefTailAddrInst>(User)) {
+      // The address of a tail element.
+      for (Operand *TailUse : RTA->getUses()) {
+        SILInstruction *TailUser = TailUse->getUser();
+        if (auto *IA = dyn_cast<IndexAddrInst>(TailUser)) {
+          // An index_addr yields the address of any tail element. Only if the
+          // second operand (the index) is an integer literal we can figure out
+          // which tail element is refereneced.
+          int TailIdx = -1;
+          if (auto *Index = dyn_cast<IntegerLiteralInst>(IA->getIndex()))
+            TailIdx = Index->getValue().getZExtValue();
+
+          for (Operand *IAUse : IA->getUses()) {
+            if (!handleTailAddr(TailIdx, IAUse->getUser(), TailStores))
+              return false;
+          }
+        // Without an index_addr it's the first tail element.
+        } else if (!handleTailAddr(/*TailIdx*/0, TailUser, TailStores)) {
+          return false;
+        }
+      }
+    } else if (!isValidUseOfObject(User, /*isCOWObject*/false, FindStringCall)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+class GlobalVariableMangler : public Mangle::ASTMangler {
+public:
+  std::string mangleOutlinedVariable(SILFunction *F, int &uniqueIdx) {
+    std::string GlobName;
+    do {
+      beginManglingWithoutPrefix();
+      appendOperator(F->getName());
+      appendOperator("Tv", Index(uniqueIdx++));
+      GlobName = finalize();
+    } while (F->getModule().lookUpGlobalVariable(GlobName));
+
+    return GlobName;
+  }
+};
+
+/// Try to convert an object allocation into a statically initialized object.
+///
+/// In general this works for any class, but in practice it will only kick in
+/// for array buffer objects. The use cases are array literals in a function.
+/// For example:
+///     func getarray() -> [Int] {
+///       return [1, 2, 3]
+///     }
+void SILGlobalOpt::optimizeObjectAllocation(AllocRefInst *ARI) {
+
+  if (ARI->isObjC())
+    return;
+
+  // Check how many tail allocated elements are on the object.
+  ArrayRef<Operand> TailCounts = ARI->getTailAllocatedCounts();
+  SILType TailType;
+  unsigned NumTailElems = 0;
+  if (TailCounts.size() > 0) {
+    // We only support a single tail allocated array.
+    if (TailCounts.size() > 1)
+      return;
+    // The number of tail allocated elements must be constant.
+    if (auto *ILI = dyn_cast<IntegerLiteralInst>(TailCounts[0].get())) {
+      if (ILI->getValue().getActiveBits() > 20)
+        return;
+      NumTailElems = ILI->getValue().getZExtValue();
+      TailType = ARI->getTailAllocatedTypes()[0];
+    } else {
+      return;
+    }
+  }
+  SILType Ty = ARI->getType();
+  ClassDecl *Cl = Ty.getClassOrBoundGenericClass();
+  if (!Cl)
+    return;
+  llvm::SmallVector<VarDecl *, 16> Fields;
+  getFields(Cl, Fields);
+
+  // Get the initialization stores of the object's properties and tail
+  // allocated elements. Also check if there are any "bad" uses of the object.
+  llvm::DenseMap<VarDecl *, StoreInst *> MemberStores;
+  llvm::SmallVector<StoreInst *, 16> TailStores;
+  TailStores.resize(NumTailElems);
+  ApplyInst *FindStringCall = nullptr;
+  if (!getObjectInitVals(ARI, MemberStores, TailStores, &FindStringCall))
+    return;
+
+  // Is there a store for all the class properties?
+  if (MemberStores.size() != Fields.size())
+    return;
+
+  // Is there a store for all tail allocated elements?
+  for (auto V : TailStores) {
+    if (!V)
+      return;
+  }
+
+  DEBUG(llvm::dbgs() << "Outline global variable in " <<
+        ARI->getFunction()->getName() << '\n');
+
+  // Create a name for the outlined global variable.
+  GlobalVariableMangler Mangler;
+  std::string GlobName =
+    Mangler.mangleOutlinedVariable(ARI->getFunction(), GlobIdx);
+
+  SILGlobalVariable *Glob =
+    SILGlobalVariable::create(*Module, SILLinkage::Private, IsNotSerialized,
+                              GlobName, ARI->getType());
+
+  // Schedule all init values for cloning into the initializer of Glob.
+  StaticInitCloner Cloner(Glob);
+  for (VarDecl *Field : Fields) {
+    StoreInst *MemberStore = MemberStores[Field];
+    Cloner.add(cast<SingleValueInstruction>(MemberStore->getSrc()));
+  }
+  for (StoreInst *TailStore : TailStores) {
+    Cloner.add(cast<SingleValueInstruction>(TailStore->getSrc()));
+  }
+
+  // Create the class property initializers
+  llvm::SmallVector<SILValue, 16> ObjectArgs;
+  for (VarDecl *Field : Fields) {
+    StoreInst *MemberStore = MemberStores[Field];
+    assert(MemberStore);
+    ObjectArgs.push_back(Cloner.clone(
+                           cast<SingleValueInstruction>(MemberStore->getSrc())));
+    MemberStore->eraseFromParent();
+  }
+  // Create the initializers for the tail elements.
+  unsigned NumBaseElements = ObjectArgs.size();
+  for (StoreInst *TailStore : TailStores) {
+    ObjectArgs.push_back(Cloner.clone(
+                           cast<SingleValueInstruction>(TailStore->getSrc())));
+    TailStore->eraseFromParent();
+  }
+  // Create the initializer for the object itself.
+  SILBuilder StaticInitBuilder(Glob);
+  StaticInitBuilder.createObject(ArtificialUnreachableLocation(),
+                                 ARI->getType(), ObjectArgs, NumBaseElements);
+
+  // Replace the alloc_ref by global_value + strong_retain instructions.
+  SILBuilder B(ARI);
+  GlobalValueInst *GVI = B.createGlobalValue(ARI->getLoc(), Glob);
+  B.createStrongRetain(ARI->getLoc(), GVI, B.getDefaultAtomicity());
+  while (!ARI->use_empty()) {
+    Operand *Use = *ARI->use_begin();
+    SILInstruction *User = Use->getUser();
+    switch (User->getKind()) {
+      case SILInstructionKind::DeallocRefInst:
+        User->eraseFromParent();
+        break;
+      default:
+        Use->set(GVI);
+    }
+  }
+  if (FindStringCall && NumTailElems > 16) {
+    assert(&*std::next(ARI->getIterator()) != FindStringCall &&
+           "FindStringCall must not be the next instruction after ARI because "
+           "deleting it would invalidate the instruction iterator");
+    replaceFindStringCall(FindStringCall);
+  }
+
+  ARI->eraseFromParent();
+
+  HasChanged = true;
+}
+
+/// Replaces a call to _findStringSwitchCase with a call to
+/// _findStringSwitchCaseWithCache which builds a cache (e.g. a Dictionary) and
+/// stores it into a global variable. Then subsequent calls to this function can
+/// do a fast lookup using the cache.
+void SILGlobalOpt::replaceFindStringCall(ApplyInst *FindStringCall) {
+  // Find the replacement function in the swift stdlib.
+  SmallVector<ValueDecl *, 1> results;
+  Module->getASTContext().lookupInSwiftModule("_findStringSwitchCaseWithCache",
+                                              results);
+  if (results.size() != 1)
+    return;
+
+  auto *FD = dyn_cast<FuncDecl>(results.front());
+  if (!FD)
+    return;
+
+  std::string Mangled = SILDeclRef(FD, SILDeclRef::Kind::Func).mangle();
+  SILFunction *replacementFunc = Module->findFunction(Mangled,
+                                                    SILLinkage::PublicExternal);
+  if (!replacementFunc)
+    return;
+
+  SILFunctionType *FTy = replacementFunc->getLoweredFunctionType();
+  if (FTy->getNumParameters() != 3)
+    return;
+
+  SILType cacheType = FTy->getParameters()[2].getSILStorageType().getObjectType();
+  NominalTypeDecl *cacheDecl = cacheType.getNominalOrBoundGenericNominal();
+  if (!cacheDecl)
+    return;
+  SILType wordTy = cacheType.getFieldType(
+                            cacheDecl->getStoredProperties().front(), *Module);
+
+  GlobalVariableMangler Mangler;
+  std::string GlobName =
+    Mangler.mangleOutlinedVariable(FindStringCall->getFunction(), GlobIdx);
+
+  // Create an "opaque" global variable which is passed as inout to
+  // _findStringSwitchCaseWithCache and into which the function stores the
+  // "cache".
+  SILGlobalVariable *CacheVar =
+    SILGlobalVariable::create(*Module, SILLinkage::Private, IsNotSerialized,
+                              GlobName, cacheType);
+
+  SILLocation Loc = FindStringCall->getLoc();
+  SILBuilder StaticInitBuilder(CacheVar);
+  auto *Zero = StaticInitBuilder.createIntegerLiteral(Loc, wordTy, 0);
+  StaticInitBuilder.createStruct(ArtificialUnreachableLocation(), cacheType,
+                                 {Zero, Zero});
+
+  SILBuilder B(FindStringCall);
+  GlobalAddrInst *CacheAddr = B.createGlobalAddr(FindStringCall->getLoc(),
+                                                 CacheVar);
+  FunctionRefInst *FRI = B.createFunctionRef(FindStringCall->getLoc(),
+                                             replacementFunc);
+  ApplyInst *NewCall = B.createApply(FindStringCall->getLoc(), FRI,
+                                     FindStringCall->getSubstitutions(),
+                                     { FindStringCall->getArgument(0),
+                                       FindStringCall->getArgument(1),
+                                       CacheAddr },
+                                     FindStringCall->isNonThrowing());
+
+  FindStringCall->replaceAllUsesWith(NewCall);
+  FindStringCall->eraseFromParent();
+}
+
 /// Optimize access to the global variable, which is known
 /// to have a constant value. Replace all loads from the
 /// global address by invocations of a getter that returns
@@ -886,17 +1453,31 @@ bool SILGlobalOpt::run() {
 
     // Cache cold blocks per function.
     ColdBlockInfo ColdBlocks(DA);
+    GlobIdx = 0;
     for (auto &BB : F) {
       bool IsCold = ColdBlocks.isCold(&BB);
-      for (auto &I : BB)
-        if (BuiltinInst *BI = dyn_cast<BuiltinInst>(&I)) {
+      auto Iter = BB.begin();
+      while (Iter != BB.end()) {
+        SILInstruction *I = &*Iter;
+        Iter++;
+        if (auto *BI = dyn_cast<BuiltinInst>(I)) {
           collectOnceCall(BI);
-        } else if (ApplyInst *AI = dyn_cast<ApplyInst>(&I)) {
+        } else if (auto *AI = dyn_cast<ApplyInst>(I)) {
           if (!IsCold)
             collectGlobalInitCall(AI);
-        } else if (GlobalAddrInst *GAI = dyn_cast<GlobalAddrInst>(&I)) {
-            collectGlobalAccess(GAI);
+        } else if (auto *GAI = dyn_cast<GlobalAddrInst>(I)) {
+          collectGlobalAccess(GAI);
+        } else if (auto *ARI = dyn_cast<AllocRefInst>(I)) {
+          if (!F.isSerialized()) {
+            // Currently we cannot serialize a function which refers to a
+            // statically initialized global. So we don't do the optimization
+            // for serializable functions.
+            // TODO: We may do the optimization _after_ serialization in the
+            // pass pipeline.
+            optimizeObjectAllocation(ARI);
+          }
         }
+      }
     }
   }
 
@@ -920,13 +1501,12 @@ class SILGlobalOptPass : public SILModuleTransform
   void run() override {
     DominanceAnalysis *DA = PM->getAnalysis<DominanceAnalysis>();
     if (SILGlobalOpt(getModule(), DA).run()) {
-      invalidateAnalysis(SILAnalysis::InvalidationKind::FunctionBody);
+      invalidateAll();
     }
   }
 
-  StringRef getName() override { return "SIL Global Optimization"; }
 };
-} // anonymous
+} // end anonymous namespace
 
 SILTransform *swift::createGlobalOpt() {
   return new SILGlobalOptPass();

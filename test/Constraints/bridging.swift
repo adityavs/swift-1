@@ -1,4 +1,4 @@
-// RUN: %target-swift-frontend -parse -verify %s
+// RUN: %target-swift-frontend -typecheck -verify %s
 
 // REQUIRES: objc_interop
 
@@ -13,7 +13,8 @@ public class BridgedClass : NSObject, NSCopying {
 
 public class BridgedClassSub : BridgedClass { }
 
-// Attempt to bridge to a non-whitelisted type from another module.
+// Attempt to bridge to a type from another module. We only allow this for a
+// few specific types, like String.
 extension LazyFilterIterator : _ObjectiveCBridgeable { // expected-error{{conformance of 'LazyFilterIterator' to '_ObjectiveCBridgeable' can only be written in module 'Swift'}}
   public typealias _ObjectiveCType = BridgedClassSub
 
@@ -194,12 +195,13 @@ let d: Double = 3.14159
 inferDouble = d
 
 // rdar://problem/17962491
-var inferDouble2 = 1 % 3 / 3.0 // expected-error{{'%' is unavailable: Use truncatingRemainder instead}}
+_ = 1 % 3 / 3.0 // expected-error{{'%' is unavailable: For floating point numbers use truncatingRemainder instead}}
+var inferDouble2 = 1 / 3 / 3.0
 let d2: Double = 3.14159
 inferDouble2 = d2
 
 // rdar://problem/18269449
-var i1: Int = 1.5 * 3.5 // expected-error {{binary operator '*' cannot be applied to two 'Double' operands}} expected-note {{expected an argument list of type '(Int, Int)'}}
+var i1: Int = 1.5 * 3.5 // expected-error {{cannot convert value of type 'Double' to specified type 'Int'}}
 
 // rdar://problem/18330319
 func rdar18330319(_ s: String, d: [String : AnyObject]) {
@@ -214,8 +216,8 @@ func rdar19551164b(_ s: NSString, _ a: NSArray) {
 }
 
 // rdar://problem/19695671
-func takesSet<T: Hashable>(_ p: Set<T>) {}  // expected-note {{in call to function 'takesSet'}}
-func takesDictionary<K: Hashable, V>(_ p: Dictionary<K, V>) {} // expected-note {{in call to function 'takesDictionary'}}
+func takesSet<T>(_ p: Set<T>) {}  // expected-note {{in call to function 'takesSet'}}
+func takesDictionary<K, V>(_ p: Dictionary<K, V>) {} // expected-note {{in call to function 'takesDictionary'}}
 func takesArray<T>(_ t: Array<T>) {} // expected-note {{in call to function 'takesArray'}}
 func rdar19695671() {
   takesSet(NSSet() as! Set) // expected-error{{generic parameter 'T' could not be inferred}}
@@ -288,7 +290,7 @@ func rdar19836341(_ ns: NSString?, vns: NSString?) {
 // <rdar://problem/20029786> Swift compiler sometimes suggests changing "as!" to "as?!"
 func rdar20029786(_ ns: NSString?) {
   var s: String = ns ?? "str" as String as String // expected-error{{cannot convert value of type 'NSString?' to expected argument type 'String?'}}
-  var s2 = ns ?? "str" as String as String // expected-error {{binary operator '??' cannot be applied to operands of type 'NSString?' and 'String'}} expected-note{{}}
+  var s2 = ns ?? "str" as String as String // expected-error {{cannot convert value of type 'String' to expected argument type 'NSString'}}
 
   let s3: NSString? = "str" as String? // expected-error {{cannot convert value of type 'String?' to specified type 'NSString?'}}
 
@@ -299,9 +301,14 @@ func rdar20029786(_ ns: NSString?) {
 // <rdar://problem/19813772> QoI: Using as! instead of as in this case produces really bad diagnostic
 func rdar19813772(_ nsma: NSMutableArray) {
   var a1 = nsma as! Array // expected-error{{generic parameter 'Element' could not be inferred in cast to 'Array<_>'}} expected-note {{explicitly specify the generic arguments to fix this issue}} {{26-26=<Any>}}
-  // FIXME: The following diagnostic is misleading and should not happen: expected-warning@-1{{cast from 'NSMutableArray' to unrelated type 'Array<_>' always fails}}
   var a2 = nsma as! Array<AnyObject> // expected-warning{{forced cast from 'NSMutableArray' to 'Array<AnyObject>' always succeeds; did you mean to use 'as'?}} {{17-20=as}}
   var a3 = nsma as Array<AnyObject>
+}
+
+func rdar28856049(_ nsma: NSMutableArray) {
+  _ = nsma as? [BridgedClass]
+  _ = nsma as? [BridgedStruct]
+  _ = nsma as? [BridgedClassSub]
 }
 
 

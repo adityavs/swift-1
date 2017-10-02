@@ -2,19 +2,22 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
 #define DEBUG_TYPE "sil-inst-utils"
 #include "swift/SIL/InstructionUtils.h"
+#include "swift/AST/SubstitutionMap.h"
+#include "swift/Basic/NullablePtr.h"
+#include "swift/SIL/Projection.h"
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILBasicBlock.h"
-#include "swift/SIL/Projection.h"
+#include "swift/SIL/SILVisitor.h"
 
 using namespace swift;
 
@@ -37,7 +40,7 @@ SILValue swift::getUnderlyingAddressRoot(SILValue V) {
       case ValueKind::StructElementAddrInst:
       case ValueKind::TupleElementAddrInst:
       case ValueKind::UncheckedTakeEnumDataAddrInst:
-        V2 = cast<SILInstruction>(V2)->getOperand(0);
+        V2 = cast<SingleValueInstruction>(V2)->getOperand(0);
         break;
       default:
         break;
@@ -60,15 +63,15 @@ SILValue swift::getUnderlyingObjectStopAtMarkDependence(SILValue V) {
 
 static bool isRCIdentityPreservingCast(ValueKind Kind) {
   switch (Kind) {
-    case ValueKind::UpcastInst:
-    case ValueKind::UncheckedRefCastInst:
-    case ValueKind::UncheckedRefCastAddrInst:
-    case ValueKind::UnconditionalCheckedCastInst:
-    case ValueKind::RefToBridgeObjectInst:
-    case ValueKind::BridgeObjectToRefInst:
-      return true;
-    default:
-      return false;
+  case ValueKind::UpcastInst:
+  case ValueKind::UncheckedRefCastInst:
+  case ValueKind::UnconditionalCheckedCastInst:
+  case ValueKind::UnconditionalCheckedCastValueInst:
+  case ValueKind::RefToBridgeObjectInst:
+  case ValueKind::BridgeObjectToRefInst:
+    return true;
+  default:
+    return false;
   }
 }
 
@@ -84,7 +87,7 @@ SILValue swift::stripSinglePredecessorArgs(SILValue V) {
     
     // First try and grab the single predecessor of our parent BB. If we don't
     // have one, bail.
-    SILBasicBlock *Pred = BB->getSinglePredecessor();
+    SILBasicBlock *Pred = BB->getSinglePredecessorBlock();
     if (!Pred)
       return V;
     
@@ -123,7 +126,7 @@ SILValue swift::stripCastsWithoutMarkDependence(SILValue V) {
     auto K = V->getKind();
     if (isRCIdentityPreservingCast(K) ||
         K == ValueKind::UncheckedTrivialBitCastInst) {
-      V = cast<SILInstruction>(V)->getOperand(0);
+      V = cast<SingleValueInstruction>(V)->getOperand(0);
       continue;
     }
 
@@ -139,7 +142,7 @@ SILValue swift::stripCasts(SILValue V) {
     if (isRCIdentityPreservingCast(K)
         || K == ValueKind::UncheckedTrivialBitCastInst
         || K == ValueKind::MarkDependenceInst) {
-      V = cast<SILInstruction>(V)->getOperand(0);
+      V = cast<SingleValueInstruction>(V)->getOperand(0);
       continue;
     }
     
@@ -153,8 +156,8 @@ SILValue swift::stripUpCasts(SILValue V) {
   
   V = stripSinglePredecessorArgs(V);
   
-  while (isa<UpcastInst>(V))
-    V = stripSinglePredecessorArgs(cast<UpcastInst>(V)->getOperand());
+  while (auto upcast = dyn_cast<UpcastInst>(V))
+    V = stripSinglePredecessorArgs(upcast->getOperand());
   
   return V;
 }
@@ -180,7 +183,7 @@ SILValue swift::stripAddressProjections(SILValue V) {
     V = stripSinglePredecessorArgs(V);
     if (!Projection::isAddressProjection(V))
       return V;
-    V = cast<SILInstruction>(V)->getOperand(0);
+    V = cast<SingleValueInstruction>(V)->getOperand(0);
   }
 }
 
@@ -189,7 +192,7 @@ SILValue swift::stripUnaryAddressProjections(SILValue V) {
     V = stripSinglePredecessorArgs(V);
     if (!Projection::isAddressProjection(V))
       return V;
-    auto *Inst = cast<SILInstruction>(V);
+    auto *Inst = cast<SingleValueInstruction>(V);
     if (Inst->getNumOperands() > 1)
       return V;
     V = Inst->getOperand(0);
@@ -201,7 +204,7 @@ SILValue swift::stripValueProjections(SILValue V) {
     V = stripSinglePredecessorArgs(V);
     if (!Projection::isObjectProjection(V))
       return V;
-    V = cast<SILInstruction>(V)->getOperand(0);
+    V = cast<SingleValueInstruction>(V)->getOperand(0);
   }
 }
 
@@ -220,4 +223,99 @@ SILValue swift::stripExpectIntrinsic(SILValue V) {
   if (BI->getIntrinsicInfo().ID != llvm::Intrinsic::expect)
     return V;
   return BI->getArguments()[0];
+}
+
+SILValue swift::stripBorrow(SILValue V) {
+  if (auto *BBI = dyn_cast<BeginBorrowInst>(V))
+    return BBI->getOperand();
+  return V;
+}
+
+namespace {
+
+enum class OwnershipQualifiedKind {
+  NotApplicable,
+  Qualified,
+  Unqualified,
+};
+
+struct OwnershipQualifiedKindVisitor : SILInstructionVisitor<OwnershipQualifiedKindVisitor, OwnershipQualifiedKind> {
+
+  OwnershipQualifiedKind visitSILInstruction(SILInstruction *I) {
+    return OwnershipQualifiedKind::NotApplicable;
+  }
+
+#define QUALIFIED_INST(CLASS) \
+  OwnershipQualifiedKind visit ## CLASS(CLASS *I) { \
+    return OwnershipQualifiedKind::Qualified;             \
+  }
+  QUALIFIED_INST(EndBorrowInst)
+  QUALIFIED_INST(LoadBorrowInst)
+  QUALIFIED_INST(CopyValueInst)
+  QUALIFIED_INST(CopyUnownedValueInst)
+  QUALIFIED_INST(DestroyValueInst)
+#undef QUALIFIED_INST
+
+  OwnershipQualifiedKind visitLoadInst(LoadInst *LI) {
+    if (LI->getOwnershipQualifier() == LoadOwnershipQualifier::Unqualified)
+      return OwnershipQualifiedKind::Unqualified;
+    return OwnershipQualifiedKind::Qualified;
+  }
+
+  OwnershipQualifiedKind visitStoreInst(StoreInst *SI) {
+    if (SI->getOwnershipQualifier() == StoreOwnershipQualifier::Unqualified)
+      return OwnershipQualifiedKind::Unqualified;
+    return OwnershipQualifiedKind::Qualified;
+  }
+};
+
+} // end anonymous namespace
+
+bool FunctionOwnershipEvaluator::evaluate(SILInstruction *I) {
+  assert(I->getFunction() == F.get() && "Can not evaluate function ownership "
+         "implications of an instruction that "
+         "does not belong to the instruction "
+         "that we are evaluating");
+
+  switch (OwnershipQualifiedKindVisitor().visit(I)) {
+  case OwnershipQualifiedKind::Unqualified: {
+    // If we already know that the function has unqualified ownership, just
+    // return early.
+    if (!F.get()->hasQualifiedOwnership())
+      return true;
+
+    // Ok, so we know at this point that we have qualified ownership. If we have
+    // seen any instructions with qualified ownership, we have an error since
+    // the function mixes qualified and unqualified instructions.
+    if (HasOwnershipQualifiedInstruction)
+      return false;
+
+    // Otherwise, set the function to have unqualified ownership. This will
+    // ensure that no more Qualified instructions can be added to the given
+    // function.
+    F.get()->setUnqualifiedOwnership();
+    return true;
+  }
+  case OwnershipQualifiedKind::Qualified: {
+    // First check if our function has unqualified ownership. If we already do
+    // have unqualified ownership, then we know that we have already seen an
+    // unqualified ownership instruction. This means the function has both
+    // qualified and unqualified instructions. =><=.
+    if (!F.get()->hasQualifiedOwnership())
+      return false;
+
+    // Ok, at this point we know that we are still qualified. Since functions
+    // start as qualified, we need to set the HasOwnershipQualifiedInstructions
+    // so we do not need to look back through the function if we see an
+    // unqualified instruction later on.
+    HasOwnershipQualifiedInstruction = true;
+    return true;
+  }
+  case OwnershipQualifiedKind::NotApplicable: {
+    // Not Applicable instr
+    return true;
+  }
+  }
+
+  llvm_unreachable("Unhandled OwnershipQualifiedKind in switch.");
 }

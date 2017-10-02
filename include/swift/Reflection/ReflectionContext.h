@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -24,6 +24,7 @@
 #include "swift/Reflection/TypeLowering.h"
 #include "swift/Reflection/TypeRef.h"
 #include "swift/Reflection/TypeRefBuilder.h"
+#include "swift/Runtime/Unreachable.h"
 
 #include <iostream>
 #include <set>
@@ -49,7 +50,6 @@ public:
   using super::getBuilder;
   using super::readIsaMask;
   using super::readTypeFromMetadata;
-  using super::readParentFromMetadata;
   using super::readGenericArgFromMetadata;
   using super::readMetadataFromInstance;
   using typename super::StoredPointer;
@@ -62,6 +62,11 @@ public:
 
   MemoryReader &getReader() {
     return *this->Reader;
+  }
+
+  unsigned getSizeOfHeapObject() {
+    // This must match sizeof(HeapObject) for the target.
+    return sizeof(StoredPointer) + 8;
   }
 
   void dumpAllSections(std::ostream &OS) {
@@ -92,17 +97,14 @@ public:
         // Figure out where the stored properties of this class begin
         // by looking at the size of the superclass
         bool valid;
-        unsigned size, align;
-        auto super =
-            this->readSuperClassFromClassMetadata(MetadataAddress);
-        if (super) {
-          std::tie(valid, size, align) =
-              this->readInstanceSizeAndAlignmentFromClassMetadata(super);
+        unsigned start;
+        std::tie(valid, start) =
+            this->readInstanceStartAndAlignmentFromClassMetadata(MetadataAddress);
 
-          // Perform layout
-          if (valid)
-            TI = TC.getClassInstanceTypeInfo(TR, size, align);
-        }
+        // Perform layout
+        if (valid)
+          TI = TC.getClassInstanceTypeInfo(TR, start);
+
         break;
       }
       default:
@@ -241,7 +243,12 @@ public:
         if (!getReader().readInteger(ExistentialAddress, &BoxAddress))
           return false;
 
-        *OutInstanceAddress = RemoteAddress(BoxAddress);
+        // Address = BoxAddress + (sizeof(HeapObject) + alignMask) & ~alignMask)
+        auto Alignment = InstanceTI->getAlignment();
+        auto StartOfValue = BoxAddress + getSizeOfHeapObject();
+        // Align.
+        StartOfValue += Alignment - StartOfValue % Alignment;
+        *OutInstanceAddress = RemoteAddress(StartOfValue);
       }
       return true;
     }
@@ -364,6 +371,11 @@ private:
     // solve the problem.
     while (!CaptureTypes.empty()) {
       const TypeRef *OrigCaptureTR = CaptureTypes[0];
+
+      // If we failed to demangle the capture type, we cannot proceed.
+      if (OrigCaptureTR == nullptr)
+        return nullptr;
+
       const TypeRef *SubstCaptureTR = nullptr;
 
       // If we have enough substitutions to make this captured value's
@@ -447,14 +459,12 @@ private:
       auto Base = cast<GenericArgumentMetadataSource>(MS)->getSource();
       return isMetadataSourceReady(Base, Builder);
     }
-    case MetadataSourceKind::Parent: {
-      auto Base = cast<ParentMetadataSource>(MS)->getChild();
-      return isMetadataSourceReady(Base, Builder);
-    }
     case MetadataSourceKind::Self:
     case MetadataSourceKind::SelfWitnessTable:
       return true;
     }
+
+    swift_runtime_unreachable("Unhandled MetadataSourceKind in switch.");
   }
 
   /// Read metadata for a captured generic type from a closure context.
@@ -481,7 +491,7 @@ private:
       // the heap object header, in the 'necessary bindings' area.
       //
       // We should only have the index of a type metadata record here.
-      unsigned Offset = sizeof(StoredPointer) + 8 +
+      unsigned Offset = getSizeOfHeapObject() +
                         sizeof(StoredPointer) * Index;
 
       StoredPointer MetadataAddress;
@@ -532,19 +542,6 @@ private:
         break;
 
       return Arg;
-    }
-    case MetadataSourceKind::Parent: {
-      auto Base = readMetadataSource(Context,
-          cast<ParentMetadataSource>(MS)->getChild(),
-          Builder);
-      if (!Base.first)
-        break;
-
-      auto Parent = readParentFromMetadata(Base.second);
-      if (!Parent.first)
-        break;
-
-      return Parent;
     }
     case MetadataSourceKind::Self:
     case MetadataSourceKind::SelfWitnessTable:

@@ -9,7 +9,11 @@ set(UTILS_SOURCES
   Utils/LoadStoreOptUtils.cpp
   Utils/Local.cpp
   Utils/LoopUtils.cpp
+  Utils/OptimizerStatsUtils.cpp
+  Utils/PerformanceInlinerUtils.cpp
   Utils/SILInliner.cpp
   Utils/SILSSAUpdater.cpp
+  Utils/SpecializationMangler.cpp
+  Utils/StackNesting.cpp
   PARENT_SCOPE)
 

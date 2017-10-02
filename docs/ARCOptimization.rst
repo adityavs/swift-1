@@ -232,7 +232,8 @@ this is true. The rule for conversions is that a conversion that preserves RC
 identity must have the following properties:
 
 1. Both of its arguments must be non-trivial values with the same ownership
-   semantics (i.e. unowned, strong, weak). This means that conversions such as:
+   semantics (i.e. unowned, strong, weak). This means that the following
+   conversions do not propagate RC identity:
 
    - address_to_pointer
    - pointer_to_address
@@ -391,6 +392,28 @@ If this semantic tag is applied to a function, then we know that:
 This allows one, when performing ARC code motion, to ignore blocks that contain
 an apply to this function as long as the block does not have any other side
 effect having instructions.
+
+Unreachable Code and Lifetimes
+==============================
+
+The general case of unreachable code in terms of lifetime balancing has further
+interesting properties. Namely, an unreachable and noreturn functions signify a
+scope that has been split. This means that objects that are alive in that
+scope's lifetime may never end. This means that:
+
+1. While we can not ignore all such unreachable terminated blocks for ARC
+purposes for instance, if we sink a retain past a br into a non
+arc.programtermination_point block, we must sink the retain into the block.
+
+2. If we are able to infer that an object's lifetime scope would never end due
+to the unreachable/no-return function, then we do not need to end the lifetime
+of the object early. An example of a situation where this can happen is with
+closure specialization. In closure specialization, we clone a caller that takes
+in a closure and create a copy of the closure in the caller with the specific
+closure. This allows for the closure to be eliminated in the specialized
+function and other optimizations to come into play. Since the lifetime of the
+original closure extended past any assertions in the original function, we do
+not need to insert releases in such locations to maintain program behavior.
 
 ARC Sequence Optimization
 =========================
@@ -861,3 +884,69 @@ Now imagine that we move the strong_retain before the is_unique. Then we have::
 Thus is_unique is guaranteed to return false introducing a copy that was not
 needed. We wish to avoid that if it is at all possible.
 
+Deinit Model
+============
+
+The semantics around deinits in swift are a common area of confusion. This
+section is not attempting to state where the deinit model may be in the future,
+but is just documenting where things are today in the hopes of improving
+clarity.
+
+The following characteristics of deinits are important to the optimizer:
+
+1. deinits run on the same thread and are not asynchronous like Java
+   finalizers.
+2. deinits are not sequenced with regards to each other or code in normal
+   control flow.
+3. If the optimizer takes advantage of the lack of sequencing it must do so in a
+   way that preserves memory safety.
+
+Consider the following pseudo-Swift example::
+
+  class D {}
+  class D1 : D {}
+  class D2 : D {}
+
+  var GLOBAL_D : D = D1()
+
+  class C { deinit { GLOBAL_D = D2() } }
+
+  func main() {
+    let c = C()
+    let d = GLOBAL_D
+    useC(c)
+    useD(d)
+  }
+
+  main()
+
+Assume that useC does not directly in any way touch an instance of class D
+except via the destructor.
+
+Since memory operations in normal control flow are not sequenced with respect to
+deinits, there are two correct programs here that the optimizer can produce: the
+original and the one where useC(c) and GLOBAL_D are swapped, i.e.::
+
+  func main() {
+    let c = C()
+    useC(c)
+    let d = GLOBAL_D
+    useD(d)
+  }
+
+In the first program, d would be an instance of class D1. In the second, it
+would be an instance of class D2. Notice how in both programs though, no
+deinitialized object is accessed. On the other hand, imagine if we had split
+main like so::
+
+  func main() {
+    let c = C()
+    let d = unsafe_unowned_load(GLOBAL_D)
+    useC(c)
+    let owned_d = retain(d)
+    useD(owned_d)
+  }
+
+In this case, we would be passing off to useD a deallocated instance of class D1
+which would be undefined behavior. An optimization that produced such code would
+be a miscompile.

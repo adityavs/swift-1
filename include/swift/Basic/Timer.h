@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -33,7 +33,7 @@ namespace swift {
   public:
     explicit SharedTimer(StringRef name) {
       if (CompilationTimersEnabled == State::Enabled)
-        Timer.emplace(name, StringRef("Swift compilation"));
+        Timer.emplace(name, name, "swift", "Swift compilation");
       else
         CompilationTimersEnabled = State::Skipped;
     }
@@ -44,6 +44,66 @@ namespace swift {
              "a timer has already been created");
       CompilationTimersEnabled = State::Enabled;
     }
+  };
+
+  /// A SharedTimer for recursive routines.
+  /// void example() {
+  ///  RecursiveSharedTimer::Guard guard; // MUST BE AT TOP SCOPE of function to
+  ///  work right! if (auto s = getASTContext().Stats) {
+  ///    guard =
+  ///    ctx.Stats->getFrontendRecursiveSharedTimers().NominalTypeDecl__lookupDirect.getGuard();
+  //  }
+  ///   ...
+  /// }
+
+  class RecursiveSharedTimer {
+  private:
+    int recursionCount = 0;
+    const StringRef name;
+    llvm::Optional<SharedTimer> timer;
+
+    void enterRecursiveFunction() {
+      assert(recursionCount >= 0  &&  "too many exits");
+      if (recursionCount++ == 0)
+        timer.emplace(name);
+    }
+    void exitRecursiveFunction() {
+      assert(recursionCount > 0  &&  "too many exits");
+      if (--recursionCount == 0)
+        timer.reset();
+    }
+
+  public:
+    RecursiveSharedTimer(StringRef name) : name(name) {}
+
+    struct Guard {
+      RecursiveSharedTimer *recursiveTimerOrNull;
+
+      Guard(RecursiveSharedTimer *rst) : recursiveTimerOrNull(rst) {
+        if (recursiveTimerOrNull)
+          recursiveTimerOrNull->enterRecursiveFunction();
+      }
+      ~Guard() {
+        if (recursiveTimerOrNull)
+          recursiveTimerOrNull->exitRecursiveFunction();
+      }
+
+      // All this stuff is to do an RAII object that be moved.
+      Guard() : recursiveTimerOrNull(nullptr) {}
+      Guard(Guard &&other) {
+        recursiveTimerOrNull = other.recursiveTimerOrNull;
+        other.recursiveTimerOrNull = nullptr;
+      }
+      Guard &operator=(Guard &&other) {
+        recursiveTimerOrNull = other.recursiveTimerOrNull;
+        other.recursiveTimerOrNull = nullptr;
+        return *this;
+      }
+      Guard(const Guard &) = delete;
+      Guard &operator=(const Guard &) = delete;
+    };
+
+    Guard getGuard() { return Guard(this); }
   };
 } // end namespace swift
 

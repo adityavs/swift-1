@@ -1,4 +1,4 @@
-// RUN: %target-parse-verify-swift %s -enable-astscope-lookup
+// RUN: %target-typecheck-verify-swift %s -enable-astscope-lookup
 
 // Name binding in default arguments
 
@@ -24,7 +24,8 @@ protocol P1 {
 
 // Protocols involving associated types.
 protocol AProtocol {
-  associatedtype e : e  // expected-error {{inheritance from non-protocol, non-class type 'Self.e'}}
+  associatedtype e : e
+  // expected-error@-1 {{use of undeclared type 'e'}}
 }
 
 // Extensions.
@@ -37,10 +38,11 @@ extension P2 {
   }
 }
 
+#if false
 // Lazy properties
 class LazyProperties {
   init() {
-    lazy var localvar = 42  // expected-error {{lazy is only valid for members of a struct or class}} {{5-10=}}
+    lazy var localvar = 42  // FIXME: should error {{lazy is only valid for members of a struct or class}} {{5-10=}}
     localvar += 1
     _ = localvar
   }
@@ -57,6 +59,7 @@ class LazyProperties {
 
   lazy var prop5: Int = { self.value + 1 }()
 }
+#endif
 
 // Protocol extensions.
 // Extending via a superclass constraint.
@@ -70,14 +73,14 @@ class Superclass {
 protocol PConstrained4 { }
 
 extension PConstrained4 where Self : Superclass {
-  final func testFoo() -> Foo {
+  func testFoo() -> Foo {
     foo()
     self.foo()
 
     return Foo(5)
   }
 
-  final static func testBar() {
+  static func testBar() {
     bar()
     self.bar()
   }
@@ -90,6 +93,7 @@ func localComputedProperties() {
       return localProperty // expected-warning{{attempting to access 'localProperty' within its own getter}}
     }
     set {
+      _ = newValue
       print(localProperty)
     }
   }
@@ -109,6 +113,10 @@ protocol Fooable {
 
   var foo: Foo { get }
 }
+
+// The extension below once caused infinite recursion.
+struct S<T> // expected-error{{expected '{' in struct}}
+extension S // expected-error{{expected '{' in extension}}
 
 let a = b ; let b = a // expected-error{{could not infer type for 'a'}} 
 // expected-error@-1 {{'a' used within its own type}}

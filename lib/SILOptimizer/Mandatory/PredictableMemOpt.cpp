@@ -2,24 +2,26 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
 #define DEBUG_TYPE "predictable-memopt"
-#include "swift/Basic/Fallthrough.h"
+
 #include "swift/SILOptimizer/PassManager/Passes.h"
 #include "DIMemoryUseCollector.h"
 #include "swift/SIL/SILBuilder.h"
 #include "swift/SILOptimizer/Utils/Local.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
-#include "llvm/Support/Debug.h"
 #include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/Statistic.h"
+#include "llvm/Support/Compiler.h"
+#include "llvm/Support/Debug.h"
+
 using namespace swift;
 
 STATISTIC(NumLoadPromoted, "Number of loads promoted");
@@ -68,6 +70,8 @@ static SILValue getAccessPathRoot(SILValue Pointer) {
       Pointer = TEAI->getOperand();
     else if (auto SEAI = dyn_cast<StructElementAddrInst>(Pointer))
       Pointer = SEAI->getOperand();
+    else if (auto BAI = dyn_cast<BeginAccessInst>(Pointer))
+      Pointer = BAI->getSource();
     else
       return Pointer;
   }
@@ -86,7 +90,8 @@ static SILValue getAccessPathRoot(SILValue Pointer) {
 ///
 /// If this pointer is to within an existential projection, it returns ~0U.
 ///
-static unsigned computeSubelement(SILValue Pointer, SILInstruction *RootInst) {
+static unsigned computeSubelement(SILValue Pointer,
+                                  SingleValueInstruction *RootInst) {
   unsigned SubEltNumber = 0;
   SILModule &M = RootInst->getModule();
   
@@ -95,10 +100,17 @@ static unsigned computeSubelement(SILValue Pointer, SILInstruction *RootInst) {
     if (RootInst == Pointer)
       return SubEltNumber;
     
-    auto *Inst = cast<SILInstruction>(Pointer);
-    if (auto *PBI = dyn_cast<ProjectBoxInst>(Inst)) {
+    if (auto *PBI = dyn_cast<ProjectBoxInst>(Pointer)) {
       Pointer = PBI->getOperand();
-    } else if (auto *TEAI = dyn_cast<TupleElementAddrInst>(Inst)) {
+      continue;
+    }
+
+    if (auto *BAI = dyn_cast<BeginAccessInst>(Pointer)) {
+      Pointer = BAI->getSource();
+      continue;
+    }
+
+    if (auto *TEAI = dyn_cast<TupleElementAddrInst>(Pointer)) {
       SILType TT = TEAI->getOperand()->getType();
       
       // Keep track of what subelement is being referenced.
@@ -106,7 +118,10 @@ static unsigned computeSubelement(SILValue Pointer, SILInstruction *RootInst) {
         SubEltNumber += getNumSubElements(TT.getTupleElementType(i), M);
       }
       Pointer = TEAI->getOperand();
-    } else if (auto *SEAI = dyn_cast<StructElementAddrInst>(Inst)) {
+      continue;
+    }
+
+    if (auto *SEAI = dyn_cast<StructElementAddrInst>(Pointer)) {
       SILType ST = SEAI->getOperand()->getType();
       
       // Keep track of what subelement is being referenced.
@@ -117,12 +132,14 @@ static unsigned computeSubelement(SILValue Pointer, SILInstruction *RootInst) {
       }
       
       Pointer = SEAI->getOperand();
-    } else {
-      assert((isa<InitExistentialAddrInst>(Inst) || isa<InjectEnumAddrInst>(Inst))&&
-             "Unknown access path instruction");
-      // Cannot promote loads and stores from within an existential projection.
-      return ~0U;
+      continue;
     }
+
+    
+    assert(isa<InitExistentialAddrInst>(Pointer) &&
+           "Unknown access path instruction");
+    // Cannot promote loads and stores from within an existential projection.
+    return ~0U;
   }
 }
 
@@ -184,7 +201,7 @@ namespace {
     SILModule &Module;
     
     /// TheMemory - This is either an alloc_box or alloc_stack instruction.
-    SILInstruction *TheMemory;
+    AllocationInst *TheMemory;
     
     /// This is the SILType of the memory object.
     SILType MemoryType;
@@ -206,7 +223,7 @@ namespace {
     bool HasAnyEscape = false;
     
   public:
-    AllocOptimize(SILInstruction *TheMemory,
+    AllocOptimize(AllocationInst *TheMemory,
                   SmallVectorImpl<DIMemoryUse> &Uses,
                   SmallVectorImpl<SILInstruction*> &Releases);
     
@@ -240,16 +257,18 @@ namespace {
 } // end anonymous namespace
 
 
-AllocOptimize::AllocOptimize(SILInstruction *TheMemory,
+AllocOptimize::AllocOptimize(AllocationInst *TheMemory,
                              SmallVectorImpl<DIMemoryUse> &Uses,
                              SmallVectorImpl<SILInstruction*> &Releases)
 : Module(TheMemory->getModule()), TheMemory(TheMemory), Uses(Uses),
   Releases(Releases) {
   
   // Compute the type of the memory object.
-  if (auto *ABI = dyn_cast<AllocBoxInst>(TheMemory))
-    MemoryType = ABI->getElementType();
-  else {
+  if (auto *ABI = dyn_cast<AllocBoxInst>(TheMemory)) {
+    assert(ABI->getBoxType()->getLayout()->getFields().size() == 1
+           && "optimizing multi-field boxes not implemented");
+    MemoryType = ABI->getBoxType()->getFieldType(ABI->getModule(), 0);
+  } else {
     assert(isa<AllocStackInst>(TheMemory));
     MemoryType = cast<AllocStackInst>(TheMemory)->getElementType();
   }
@@ -575,8 +594,9 @@ AggregateAvailableValues(SILInstruction *Inst, SILType LoadTy,
   // otherwise emit a load of the value.
   auto Val = AvailableValues[FirstElt];
   if (!Val.first)
-    return B.createLoad(Inst->getLoc(), Address);
-  
+    return B.createLoad(Inst->getLoc(), Address,
+                        LoadOwnershipQualifier::Unqualified);
+
   SILValue EltVal = ExtractSubElement(Val.first, Val.second, B, Inst->getLoc());
   // It must be the same type as LoadTy if available.
   assert(EltVal->getType() == LoadTy &&
@@ -600,25 +620,30 @@ bool AllocOptimize::promoteLoad(SILInstruction *Inst) {
   // diagnostics pass this like one.
   
   // We only handle load and copy_addr right now.
+  SILValue src;
   if (auto CAI = dyn_cast<CopyAddrInst>(Inst)) {
     // If this is a CopyAddr, verify that the element type is loadable.  If not,
     // we can't explode to a load.
-    if (!CAI->getSrc()->getType().isLoadable(Module))
+    src = CAI->getSrc();
+    if (!src->getType().isLoadable(Module))
       return false;
-  } else if (!isa<LoadInst>(Inst))
+  } else if (auto load = dyn_cast<LoadInst>(Inst)) {
+    src = load->getOperand();
+  } else {
     return false;
-  
+  }
+
   // If the box has escaped at this instruction, we can't safely promote the
   // load.
   if (hasEscapedAt(Inst))
     return false;
   
-  SILType LoadTy = Inst->getOperand(0)->getType().getObjectType();
+  SILType LoadTy = src->getType().getObjectType();
   
   // If this is a load/copy_addr from a struct field that we want to promote,
   // compute the access path down to the field so we can determine precise
   // def/use behavior.
-  unsigned FirstElt = computeSubelement(Inst->getOperand(0), TheMemory);
+  unsigned FirstElt = computeSubelement(src, TheMemory);
   
   // If this is a load from within an enum projection, we can't promote it since
   // we don't track subelements in a type that could be changing.
@@ -666,20 +691,20 @@ bool AllocOptimize::promoteLoad(SILInstruction *Inst) {
   // Aggregate together all of the subelements into something that has the same
   // type as the load did, and emit smaller) loads for any subelements that were
   // not available.
-  auto NewVal = AggregateAvailableValues(Inst, LoadTy, Inst->getOperand(0),
+  auto Load = cast<LoadInst>(Inst);
+  auto NewVal = AggregateAvailableValues(Load, LoadTy, Load->getOperand(),
                                          AvailableValues, FirstElt);
   
   ++NumLoadPromoted;
   
   // Simply replace the load.
-  assert(isa<LoadInst>(Inst));
-  DEBUG(llvm::dbgs() << "  *** Promoting load: " << *Inst << "\n");
+  DEBUG(llvm::dbgs() << "  *** Promoting load: " << *Load << "\n");
   DEBUG(llvm::dbgs() << "      To value: " << *NewVal << "\n");
   
-  Inst->replaceAllUsesWith(NewVal);
-  SILValue Addr = Inst->getOperand(0);
-  Inst->eraseFromParent();
-  if (auto *AddrI = dyn_cast<SILInstruction>(Addr))
+  Load->replaceAllUsesWith(NewVal);
+  SILValue Addr = Load->getOperand();
+  Load->eraseFromParent();
+  if (auto *AddrI = Addr->getDefiningInstruction())
     recursivelyDeleteTriviallyDeadInstructions(AddrI);
   return true;
 }
@@ -738,8 +763,8 @@ bool AllocOptimize::promoteDestroyAddr(DestroyAddrInst *DAI) {
   
   DEBUG(llvm::dbgs() << "  *** Promoting destroy_addr: " << *DAI << "\n");
   DEBUG(llvm::dbgs() << "      To value: " << *NewVal << "\n");
-  
-  SILBuilderWithScope(DAI).emitReleaseValueOperation(DAI->getLoc(), NewVal);
+
+  SILBuilderWithScope(DAI).emitDestroyValueOperation(DAI->getLoc(), NewVal);
   DAI->eraseFromParent();
   return true;
 }
@@ -807,7 +832,7 @@ void AllocOptimize::explodeCopyAddr(CopyAddrInst *CAI) {
       NewInst->dump();
       llvm_unreachable("Unknown instruction generated by copy_addr lowering");
       
-    case ValueKind::StoreInst:
+    case SILInstructionKind::StoreInst:
       // If it is a store to the memory object (as oppose to a store to
       // something else), track it as an access.
       if (StoreUse.isValid()) {
@@ -817,7 +842,7 @@ void AllocOptimize::explodeCopyAddr(CopyAddrInst *CAI) {
       }
       continue;
       
-    case ValueKind::LoadInst:
+    case SILInstructionKind::LoadInst:
       // If it is a load from the memory object (as oppose to a load from
       // something else), track it as an access.  We need to explicitly check to
       // see if the load accesses "TheMemory" because it could either be a load
@@ -830,12 +855,12 @@ void AllocOptimize::explodeCopyAddr(CopyAddrInst *CAI) {
       }
       continue;
       
-    case ValueKind::RetainValueInst:
-    case ValueKind::StrongRetainInst:
-    case ValueKind::StrongReleaseInst:
-    case ValueKind::UnownedRetainInst:
-    case ValueKind::UnownedReleaseInst:
-    case ValueKind::ReleaseValueInst:   // Destroy overwritten value
+    case SILInstructionKind::RetainValueInst:
+    case SILInstructionKind::StrongRetainInst:
+    case SILInstructionKind::StrongReleaseInst:
+    case SILInstructionKind::UnownedRetainInst:
+    case SILInstructionKind::UnownedReleaseInst:
+    case SILInstructionKind::ReleaseValueInst:   // Destroy overwritten value
       // These are ignored.
       continue;
     }
@@ -885,7 +910,7 @@ bool AllocOptimize::tryToRemoveDeadAllocation() {
            cast<CopyAddrInst>(U.Inst)->isTakeOfSrc()))
         break;
       // FALL THROUGH.
-     SWIFT_FALLTHROUGH;
+     LLVM_FALLTHROUGH;
     case DIUseKind::Load:
     case DIUseKind::IndirectIn:
     case DIUseKind::InOutUse:
@@ -933,11 +958,12 @@ bool AllocOptimize::doIt() {
   for (unsigned i = 0; i != Uses.size(); ++i) {
     auto &Use = Uses[i];
     // Ignore entries for instructions that got expanded along the way.
-    if (Use.Inst && Use.Kind == DIUseKind::Load)
+    if (Use.Inst && Use.Kind == DIUseKind::Load) {
       if (promoteLoad(Use.Inst)) {
         Uses[i].Inst = nullptr;  // remove entry if load got deleted.
         Changed = true;
       }
+    }
   }
   
   // destroy_addr(p) is strong_release(load(p)), try to promote it too.
@@ -949,11 +975,9 @@ bool AllocOptimize::doIt() {
         Changed = true;
       }
   }
-  
+
   // If this is an allocation, try to remove it completely.
-  if (!isa<MarkUninitializedInst>(TheMemory)
-      && !isa<MarkUninitializedBehaviorInst>(TheMemory))
-    Changed |= tryToRemoveDeadAllocation();
+  Changed |= tryToRemoveDeadAllocation();
 
   return Changed;
  }
@@ -969,24 +993,24 @@ static bool optimizeMemoryAllocations(SILFunction &Fn) {
         ++I;
         continue;
       }
+      auto Alloc = cast<AllocationInst>(Inst);
 
-      DEBUG(llvm::dbgs() << "*** DI Optimize looking at: " << *Inst << "\n");
-      DIMemoryObjectInfo MemInfo(Inst);
+      DEBUG(llvm::dbgs() << "*** DI Optimize looking at: " << *Alloc << "\n");
+      DIMemoryObjectInfo MemInfo(Alloc);
 
       // Set up the datastructure used to collect the uses of the allocation.
       SmallVector<DIMemoryUse, 16> Uses;
-      SmallVector<TermInst*, 1> FailableInits;
       SmallVector<SILInstruction*, 4> Releases;
       
       // Walk the use list of the pointer, collecting them.
-      collectDIElementUsesFrom(MemInfo, Uses, FailableInits, Releases, true);
-      
-      Changed |= AllocOptimize(Inst, Uses, Releases).doIt();
+      collectDIElementUsesFrom(MemInfo, Uses, Releases);
+
+      Changed |= AllocOptimize(Alloc, Uses, Releases).doIt();
       
       // Carefully move iterator to avoid invalidation problems.
       ++I;
-      if (Inst->use_empty()) {
-        Inst->eraseFromParent();
+      if (Alloc->use_empty()) {
+        Alloc->eraseFromParent();
         ++NumAllocRemoved;
         Changed = true;
       }
@@ -1004,7 +1028,6 @@ class PredictableMemoryOptimizations : public SILFunctionTransform {
       invalidateAnalysis(SILAnalysis::InvalidationKind::FunctionBody);
   }
 
-  StringRef getName() override { return "Predictable Memory Opts"; }
 };
 } // end anonymous namespace
 

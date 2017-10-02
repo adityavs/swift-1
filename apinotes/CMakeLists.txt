@@ -1,56 +1,7 @@
 set(SWIFT_API_NOTES_INPUTS
-  AVFoundation
-  AVKit
-  AppKit
-  AudioToolbox
-  CallKit
-  CloudKit
-  Contacts
-  CoreBluetooth
-  CoreData
-  CoreGraphics
-  CoreLocation
-  CoreSpotlight
-  CoreText
-  CryptoTokenKit
+  Accelerate
   Dispatch
-  EventKit
-  ExternalAccessory
-  Foundation
-  GameKit
-  GameplayKit
-  GLKit
-  HealthKit
-  HomeKit
-  iAd
-  Intents
-  LocalAuthentication
-  MapKit
-  MediaPlayer
-  MessageUI
-  Metal
-  MultipeerConnectivity
-  NetworkExtension
-  NotificationCenter
-  ObjectiveC
-  PassKit
-  Photos
-  QuartzCore
-  QuickLook
-  SafariServices
-  SceneKit
-  SpriteKit
-  StoreKit
-  TVMLKit
-  TVServices
-  UIKit
-  UserNotifications
-  VideoSubscriberAccount
-  WatchConnectivity
-  WatchKit
-  WebKit
-  XCTest
-  XPC
+  ScriptingBridge
   os
 )
 
@@ -67,8 +18,7 @@ endforeach()
 file(GLOB SWIFT_API_NOTES_INPUT_FILES "${SWIFT_API_NOTES_PATH}/*.apinotes")
 foreach(file ${SWIFT_API_NOTES_INPUT_FILES})
   get_filename_component(name "${file}" NAME_WE)
-  list(FIND SWIFT_API_NOTES_INPUTS "${name}" name_index)
-  if(name_index EQUAL -1)
+  if(NOT "${name}" IN_LIST SWIFT_API_NOTES_INPUTS)
     message(SEND_ERROR "Found apinotes for ${name}; please add to CMakeLists.txt")
   endif()
 endforeach()

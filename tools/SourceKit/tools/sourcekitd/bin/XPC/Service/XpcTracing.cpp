@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -14,9 +14,9 @@
 
 #include "swift/Frontend/Frontend.h"
 
-#include "llvm/Support/TimeValue.h"
 #include "llvm/Support/YAMLTraits.h"
 
+#include <chrono>
 #include <xpc/xpc.h>
 
 using namespace sourcekitd;
@@ -29,10 +29,13 @@ using namespace llvm;
 // General
 //===----------------------------------------------------------------------===//
 
-static uint64_t tracing_session = llvm::sys::TimeValue::now().msec();
+static auto tracing_session = std::chrono::system_clock::now();
 
 uint64_t trace::getTracingSession() {
-  return tracing_session;
+  using namespace std::chrono;
+  time_point<system_clock, milliseconds> msec =
+    time_point_cast<milliseconds>(tracing_session);
+  return msec.time_since_epoch().count();
 }
 
 static void append(xpc_object_t Contents, uint64_t Value) {
@@ -59,16 +62,6 @@ static void append(xpc_object_t Contents, const StringPairs &Files) {
                   append(Contents, File.second);
                 });
 }
-
-template <typename U>
-struct llvm::yaml::SequenceTraits<std::vector<U>> {
-  static size_t size(IO &Io, std::vector<U> &Vector) {
-    return Vector.size();
-  }
-  static U &element(IO &Io, std::vector<U> &Vector, size_t Index) {
-    return Vector[Index];
-  }
-};
 
 template <>
 struct llvm::yaml::MappingTraits<SwiftArguments> {

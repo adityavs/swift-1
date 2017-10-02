@@ -28,7 +28,7 @@ function(add_swift_unittest test_dirname)
 
     set(new_libnames)
     foreach(dep ${libnames})
-      if("${dep}" MATCHES "^(LLVM|Clang|gtest)")
+      if("${dep}" MATCHES "^(LLVM|Clang|gtest)" AND NOT "${CMAKE_SYSTEM_NAME}" STREQUAL "Windows")
         list(APPEND new_libnames "${LLVM_LIBRARY_OUTPUT_INTDIR}/lib${dep}.a")
       else()
         list(APPEND new_libnames "${dep}")
@@ -42,6 +42,9 @@ function(add_swift_unittest test_dirname)
   if("${CMAKE_SYSTEM_NAME}" STREQUAL "Darwin")
     set_property(TARGET "${test_dirname}" APPEND_STRING PROPERTY
       LINK_FLAGS " -Xlinker -rpath -Xlinker ${SWIFT_LIBRARY_OUTPUT_INTDIR}/swift/macosx")
+  elseif("${CMAKE_SYSTEM_NAME}" STREQUAL "Linux")
+    set_property(TARGET "${test_dirname}" APPEND_STRING PROPERTY
+      LINK_FLAGS " -latomic")
   endif()
 
   if(SWIFT_ENABLE_GOLD_LINKER AND
@@ -60,8 +63,7 @@ function(add_swift_unittest test_dirname)
   endif()
 
   if(SWIFT_RUNTIME_USE_SANITIZERS)
-    list(FIND SWIFT_RUNTIME_USE_SANITIZERS "Thread" THREAD_INDEX)
-    if(NOT THREAD_INDEX EQUAL -1)
+    if("Thread" IN_LIST SWIFT_RUNTIME_USE_SANITIZERS)
       set_property(TARGET "${test_dirname}" APPEND_STRING PROPERTY COMPILE_FLAGS
         " -fsanitize=thread")
       set_property(TARGET "${test_dirname}" APPEND_STRING PROPERTY

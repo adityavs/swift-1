@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -55,11 +55,16 @@ public:
   /// unchecked_trivial_bit_cast.
   void getRCUsers(SILValue V, llvm::SmallVectorImpl<SILInstruction *> &Users);
 
-  void handleDeleteNotification(ValueBase *V) {
+  void handleDeleteNotification(SILNode *node) {
+    auto value = dyn_cast<ValueBase>(node);
+    if (!value)
+      return;
+
     // Check the cache. If we don't find it, there is nothing to do.
-    auto Iter = RCCache.find(SILValue(V));
+    auto Iter = RCCache.find(SILValue(value));
     if (Iter == RCCache.end())
       return;
+
     // Then erase Iter from the cache.
     RCCache.erase(Iter);
   }
@@ -84,14 +89,14 @@ public:
   RCIdentityAnalysis(const RCIdentityAnalysis &) = delete;
   RCIdentityAnalysis &operator=(const RCIdentityAnalysis &) = delete;
 
-  virtual void handleDeleteNotification(ValueBase *V) override {
+  virtual void handleDeleteNotification(SILNode *node) override {
     // If the parent function of this instruction was just turned into an
     // external declaration, bail. This happens during SILFunction destruction.
-    SILFunction *F = V->getParentBB()->getParent();
+    SILFunction *F = node->getFunction();
     if (F->isExternalDeclaration()) {
       return;
     }
-    get(F)->handleDeleteNotification(V);
+    get(F)->handleDeleteNotification(node);
   }
 
   virtual bool needsNotifications() override { return true; }

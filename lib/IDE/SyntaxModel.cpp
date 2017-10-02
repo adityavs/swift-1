@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -24,6 +24,7 @@
 #include "swift/Parse/Token.h"
 #include "swift/Config.h"
 #include "swift/Subsystems.h"
+#include "clang/Basic/CharInfo.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include <vector>
@@ -50,18 +51,16 @@ SyntaxModelContext::SyntaxModelContext(SourceFile &SrcFile)
   : Impl(*new Implementation(SrcFile)) {
   const bool IsPlayground = Impl.LangOpts.Playground;
   const SourceManager &SM = Impl.SrcMgr;
-  std::vector<Token> Tokens = swift::tokenize(Impl.LangOpts, SM,
-                                              *Impl.SrcFile.getBufferID(),
-                                              /*Offset=*/0,
-                                              /*EndOffset=*/0,
-                                              /*KeepComments=*/true,
-                                           /*TokenizeInterpolatedString=*/true);
+  ArrayRef<Token> Tokens = SrcFile.getAllTokens();
   std::vector<SyntaxNode> Nodes;
   SourceLoc AttrLoc;
   SourceLoc UnaryMinusLoc;
   auto LiteralStartLoc = Optional<SourceLoc>();
   for (unsigned I = 0, E = Tokens.size(); I != E; ++I) {
     auto &Tok = Tokens[I];
+    // Ignore empty string literals between interpolations, e.g. "\(1)\(2)"
+    if (!Tok.getLength())
+        continue;
     SyntaxNodeKind Kind;
     SourceLoc Loc;
     Optional<unsigned> Length;
@@ -95,34 +94,23 @@ SyntaxModelContext::SyntaxModelContext(SourceFile &SrcFile)
 
       switch(Tok.getKind()) {
 #define KEYWORD(X) case tok::kw_##X:
-#include "swift/Parse/Tokens.def"
+#include "swift/Syntax/TokenKinds.def"
 #undef KEYWORD
-        if (Tok.getKind() != tok::kw__ &&
-            0 < I && I < Tokens.size() - 1 &&
-            (Tokens[I-1].getKind() == tok::l_paren ||
-             Tokens[I-1].getKind() == tok::comma) &&
-            (Tokens[I+1].getKind() == tok::colon ||
-             Tokens[I+1].getKind() == tok::identifier ||
-             Tokens[I+1].isKeyword())) {
-          // Keywords are allowed as argument labels and should be treated as
-          // identifiers.  The exception is '_' which is not a name.
-          Kind = SyntaxNodeKind::Identifier;
-        } else {
-          Kind = SyntaxNodeKind::Keyword;
-        }
+        case tok::contextual_keyword:
+        Kind = SyntaxNodeKind::Keyword;
         break;
 
 #define POUND_OLD_OBJECT_LITERAL(Name, NewName, OldArg, NewArg) \
       case tok::pound_##Name:
 #define POUND_OBJECT_LITERAL(Name, Desc, Proto) case tok::pound_##Name:
-#include "swift/Parse/Tokens.def"
+#include "swift/Syntax/TokenKinds.def"
         LiteralStartLoc = Loc;
         continue;
 
 #define POUND_OBJECT_LITERAL(Name, Desc, Proto)
 #define POUND_OLD_OBJECT_LITERAL(Name, NewName, OldArg, NewArg)
 #define POUND_KEYWORD(Name) case tok::pound_##Name:
-#include "swift/Parse/Tokens.def"
+#include "swift/Syntax/TokenKinds.def"
         Kind = SyntaxNodeKind::Keyword;
         break;
       case tok::identifier:
@@ -172,33 +160,18 @@ SyntaxModelContext::SyntaxModelContext(SourceFile &SrcFile)
         AttrLoc = Tok.getLoc();
         continue;
 
-      case tok::l_paren: {
-        // Check if this is a string interpolation paren.
-        if (I == 0)
-          continue;
-        auto &PrevTok = Tokens[I-1];
-        if (PrevTok.getKind() != tok::string_literal)
-          continue;
-        StringRef StrText = PrevTok.getText();
-        if (StrText.size() > 1 && StrText.back() == '\"' &&
-            !StrText.endswith("\\\""))
-          continue;
+      case tok::string_interpolation_anchor: {
         Kind = SyntaxNodeKind::StringInterpolationAnchor;
         break;
       }
 
-      case tok::r_paren: {
-        // Check if this is a string interpolation paren.
-        if (I+1 == E)
-          continue;
-        auto &NextTok = Tokens[I+1];
-        if (NextTok.getKind() != tok::string_literal)
-          continue;
-        StringRef StrText = NextTok.getText();
-        if (StrText.size() > 1 && StrText.front() == '\"')
-          continue;
-        Kind = SyntaxNodeKind::StringInterpolationAnchor;
-        break;
+      case tok::unknown: {
+        if (Tok.getRawText().startswith("\"")) {
+          // This is an invalid string literal
+          Kind = SyntaxNodeKind::String;
+          break;
+        }
+        continue;
       }
 
       default:
@@ -256,17 +229,6 @@ static const char *const RegexStrURL =
   "tn3270|urn|vemmi|wais|xcdoc|z39\\.50r|z39\\.50s)://"
   "([a-zA-Z0-9\\-_.]+/)?[a-zA-Z0-9;/?:@\\&=+$,\\-_.!~*'()%#]+";
 
-#define MARKUP_SIMPLE_FIELD(Id, Keyword, XMLKind) \
-  #Keyword "|"
-static const char *const RegexStrDocCommentField =
-  "^[ ]*- ("
-#include "swift/Markup/SimpleFields.def"
-  "returns):";
-
-static const char *const RegexStrParameter = "^[ ]?- (parameter) [^:]*:";
-
-static const char *const RegexStrDocCommentParametersHeading = "^[ ]?- (Parameters):";
-
 static const char *const RegexStrMailURL =
   "(mailto|im):[a-zA-Z0-9\\-_]+@[a-zA-Z0-9\\-_\\.!%]+";
 
@@ -274,13 +236,13 @@ static const char *const RegexStrRadarURL =
   "radar:[a-zA-Z0-9;/?:@\\&=+$,\\-_.!~*'()%#]+";
 
 class ModelASTWalker : public ASTWalker {
+  ArrayRef<Token> AllTokensInFile;
   const LangOptions &LangOpts;
   const SourceManager &SM;
   unsigned BufferID;
   std::vector<StructureElement> SubStructureStack;
   SourceLoc LastLoc;
-  static const std::regex &getURLRegex(unsigned Index);
-  static const std::regex &getDocCommentRegex(unsigned Index);
+  static const std::regex &getURLRegex(StringRef Protocol);
 
   Optional<SyntaxNode> parseFieldNode(StringRef Text, StringRef OrigText,
                                       SourceLoc OrigLoc);
@@ -290,9 +252,12 @@ public:
   SyntaxModelWalker &Walker;
   ArrayRef<SyntaxNode> TokenNodes;
 
-  ModelASTWalker(const LangOptions &LangOpts, const SourceManager &SM,
-                 unsigned BufferID, SyntaxModelWalker &Walker)
-      : LangOpts(LangOpts), SM(SM), BufferID(BufferID), Walker(Walker) { }
+  ModelASTWalker(const SourceFile &File, SyntaxModelWalker &Walker)
+      : AllTokensInFile(File.getAllTokens()),
+        LangOpts(File.getASTContext().LangOpts),
+        SM(File.getASTContext().SourceMgr),
+        BufferID(File.getBufferID().getValue()),
+        Walker(Walker) { }
 
   void visitSourceFile(SourceFile &SrcFile, ArrayRef<SyntaxNode> Tokens);
 
@@ -303,8 +268,7 @@ public:
   bool walkToDeclPre(Decl *D) override;
   bool walkToDeclPost(Decl *D) override;
   bool walkToTypeReprPre(TypeRepr *T) override;
-  std::pair<bool, Pattern*> walkToPatternPre(Pattern *P) override;
-  bool shouldWalkIntoFunctionGenericParams() override { return true; }
+  bool shouldWalkIntoGenericParams() override { return true; }
 
 private:
   static bool findUrlStartingLoc(StringRef Text, unsigned &Start,
@@ -316,10 +280,8 @@ private:
   typedef std::pair<const DeclAttribute *, SourceRange> DeclAttributeAndRange;
 
   bool handleSpecialDeclAttribute(const DeclAttribute *Decl,
-                                  std::vector<Token> &Toks);
+                                  ArrayRef<Token> Toks);
   bool handleAttrRanges(ArrayRef<DeclAttributeAndRange> DeclRanges);
-
-  void handleStmtCondition(StmtCondition cond);
 
   bool shouldPassBraceStructureNode(BraceStmt *S);
 
@@ -343,36 +305,32 @@ private:
   bool searchForURL(CharSourceRange Range);
   bool findFieldsInDocCommentLine(SyntaxNode Node);
   bool findFieldsInDocCommentBlock(SyntaxNode Node);
-  bool isVisitedBeforeInIfConfigStmt(ASTNode Node) {
+  bool isVisitedBeforeInIfConfig(ASTNode Node) {
     return VisitedNodesInsideIfConfig.count(Node) > 0;
   }
 };
 
-const std::regex &ModelASTWalker::getURLRegex(unsigned Index) {
+const std::regex &ModelASTWalker::getURLRegex(StringRef Pro) {
   static const std::regex Regexes[3] =  {
     std::regex{ RegexStrURL, std::regex::ECMAScript | std::regex::nosubs },
     std::regex{ RegexStrMailURL, std::regex::ECMAScript | std::regex::nosubs },
     std::regex{ RegexStrRadarURL, std::regex::ECMAScript | std::regex::nosubs }
   };
-  return Regexes[Index];
-}
 
-const std::regex &ModelASTWalker::getDocCommentRegex(unsigned Index) {
-  static const std::regex Regexes[3] =  {
-    std::regex {
-      RegexStrParameter,
-      std::regex::egrep | std::regex::icase | std::regex::optimize
-    },
-    std::regex {
-      RegexStrDocCommentParametersHeading,
-      std::regex::egrep | std::regex::icase | std::regex::optimize
-    },
-    std::regex {
-      RegexStrDocCommentField,
-      std::regex::egrep | std::regex::icase | std::regex::optimize
-    }
-  };
-  return Regexes[Index];
+  static const auto MailToPosition = std::find(URLProtocols.begin(),
+                                               URLProtocols.end(),
+                                               "mailto");
+  static const auto RadarPosition = std::find(URLProtocols.begin(),
+                                              URLProtocols.end(),
+                                              "radar");
+  auto Found = std::find(URLProtocols.begin(), URLProtocols.end(), Pro);
+  assert(Found != URLProtocols.end() && "bad protocol name");
+  if (Found < MailToPosition)
+    return Regexes[0];
+  else if (Found < RadarPosition)
+    return Regexes[1];
+  else
+    return Regexes[2];
 }
 
 SyntaxStructureKind syntaxStructureKindFromNominalTypeDecl(NominalTypeDecl *N) {
@@ -429,11 +387,16 @@ CharSourceRange parameterNameRangeOfCallArg(const TupleExpr *TE,
   return CharSourceRange();
 }
 
+static void setDecl(SyntaxStructureNode &N, Decl *D) {
+  N.Dcl = D;
+  N.Attrs = D->getAttrs();
+  N.DocRange = D->getRawComment().getCharSourceRange();
+}
+
 } // anonymous namespace
 
 bool SyntaxModelContext::walk(SyntaxModelWalker &Walker) {
-  ModelASTWalker ASTWalk(Impl.LangOpts, Impl.SrcMgr,
-                         *Impl.SrcFile.getBufferID(), Walker);
+  ModelASTWalker ASTWalk(Impl.SrcFile, Walker);
   ASTWalk.visitSourceFile(Impl.SrcFile, Impl.TokenNodes);
   return true;
 }
@@ -449,31 +412,42 @@ void ModelASTWalker::visitSourceFile(SourceFile &SrcFile,
 }
 
 std::pair<bool, Expr *> ModelASTWalker::walkToExprPre(Expr *E) {
-  if (isVisitedBeforeInIfConfigStmt(E))
+  if (isVisitedBeforeInIfConfig(E))
     return {false, E};
 
-  if (E->isImplicit())
-    return { true, E };
-
-  if (auto *ParentTupleExpr = dyn_cast_or_null<TupleExpr>(Parent.getAsExpr())) {
+  auto addCallArgExpr = [&](Expr *Elem, TupleExpr *ParentTupleExpr) {
     if (isCurrentCallArgExpr(ParentTupleExpr)) {
-      CharSourceRange NR = parameterNameRangeOfCallArg(ParentTupleExpr, E);
+      CharSourceRange NR = parameterNameRangeOfCallArg(ParentTupleExpr, Elem);
       SyntaxStructureNode SN;
       SN.Kind = SyntaxStructureKind::Argument;
       SN.NameRange = NR;
-      SN.BodyRange = charSourceRangeFromSourceRange(SM, E->getSourceRange());
+      SN.BodyRange = charSourceRangeFromSourceRange(SM, Elem->getSourceRange());
       if (NR.isValid()) {
         SN.Range = charSourceRangeFromSourceRange(SM, SourceRange(NR.getStart(),
-                                                                  E->getEndLoc()));
+                                                            Elem->getEndLoc()));
         passTokenNodesUntil(NR.getStart(),
                             PassNodesBehavior::ExcludeNodeAtLocation);
       }
       else
         SN.Range = SN.BodyRange;
 
-      pushStructureNode(SN, E);
+      pushStructureNode(SN, Elem);
+    }
+  };
+
+  if (auto *ParentTupleExpr = dyn_cast_or_null<TupleExpr>(Parent.getAsExpr())) {
+    // the argument value is a tuple expression already, we can just extract it
+    addCallArgExpr(E, ParentTupleExpr);
+  } else if (auto *ParentOptionalExpr = dyn_cast_or_null<OptionalEvaluationExpr>(Parent.getAsExpr())) {
+    // if an argument value is an optional expression, we should extract the
+    // argument from the subexpression
+    if (auto *ParentTupleExpr = dyn_cast_or_null<TupleExpr>(ParentOptionalExpr->getSubExpr())) {
+      addCallArgExpr(E, ParentTupleExpr);
     }
   }
+
+  if (E->isImplicit())
+    return { true, E };
 
   auto addExprElem = [&](const Expr *Elem, SyntaxStructureNode &SN) {
     if (isa<ErrorExpr>(Elem))
@@ -533,10 +507,24 @@ std::pair<bool, Expr *> ModelASTWalker::walkToExprPre(Expr *E) {
     SN.BodyRange = innerCharSourceRangeFromSourceRange(SM, E->getSourceRange());
     pushStructureNode(SN, E);
   } else if (auto *Tup = dyn_cast<TupleExpr>(E)) {
-    for (unsigned I = 0; I < Tup->getNumElements(); ++ I) {
-      SourceLoc NameLoc = Tup->getElementNameLoc(I);
-      if (NameLoc.isValid())
-        passTokenNodesUntil(NameLoc, PassNodesBehavior::ExcludeNodeAtLocation);
+    if (isCurrentCallArgExpr(Tup)) {
+      for (unsigned I = 0; I < Tup->getNumElements(); ++ I) {
+        SourceLoc NameLoc = Tup->getElementNameLoc(I);
+        if (NameLoc.isValid())
+          passTokenNodesUntil(NameLoc, PassNodesBehavior::ExcludeNodeAtLocation);
+      }
+    } else {
+      SyntaxStructureNode SN;
+      SN.Kind = SyntaxStructureKind::TupleExpression;
+      SN.Range = charSourceRangeFromSourceRange(SM, Tup->getSourceRange());
+      SN.BodyRange = innerCharSourceRangeFromSourceRange(SM,
+                                                         Tup->getSourceRange());
+
+      for (auto *Elem : Tup->getElements()) {
+        addExprElem(Elem, SN);
+      }
+
+      pushStructureNode(SN, Tup);
     }
   }
 
@@ -551,23 +539,8 @@ Expr *ModelASTWalker::walkToExprPost(Expr *E) {
   return E;
 }
 
-void ModelASTWalker::handleStmtCondition(StmtCondition cond) {
-  for (const auto &elt : cond) {
-    if (elt.getKind() != StmtConditionElement::CK_Availability) continue;
-
-    SmallVector<SourceLoc, 5> PlatformLocs;
-    elt.getAvailability()->getPlatformKeywordLocs(PlatformLocs);
-    std::for_each(PlatformLocs.begin(), PlatformLocs.end(),
-                  [&](SourceLoc loc) {
-      auto range = charSourceRangeFromSourceRange(SM, loc);
-      passNonTokenNode({SyntaxNodeKind::Keyword, range});
-    });
-  }
-}
-
-
 std::pair<bool, Stmt *> ModelASTWalker::walkToStmtPre(Stmt *S) {
-  if (isVisitedBeforeInIfConfigStmt(S)) {
+  if (isVisitedBeforeInIfConfig(S)) {
     return {false, S};
   }
   auto addExprElem = [&](SyntaxStructureElementKind K, const Expr *Elem,
@@ -584,39 +557,16 @@ std::pair<bool, Stmt *> ModelASTWalker::walkToStmtPre(Stmt *S) {
     SyntaxStructureNode SN;
     SN.Kind = SyntaxStructureKind::ForEachStatement;
     SN.Range = charSourceRangeFromSourceRange(SM, S->getSourceRange());
-    if (ForEachS->getPattern())
-      SN.Elements.emplace_back(SyntaxStructureElementKind::Id,
-                               charSourceRangeFromSourceRange(SM,
-                                     ForEachS->getPattern()->getSourceRange()));
+    if (ForEachS->getPattern()) {
+      auto Pat = ForEachS->getPattern();
+      if (!Pat->isImplicit()) {
+        SourceRange ElemRange = Pat->getSourceRange();
+        SN.Elements.emplace_back(SyntaxStructureElementKind::Id,
+                                 charSourceRangeFromSourceRange(SM, ElemRange));
+      }
+    }
     if (ForEachS->getSequence())
       addExprElem(SyntaxStructureElementKind::Expr, ForEachS->getSequence(),SN);
-    pushStructureNode(SN, S);
-
-  } else if (auto *ForS = dyn_cast<ForStmt>(S)) {
-    SyntaxStructureNode SN;
-    SN.Kind = SyntaxStructureKind::ForStatement;
-    SN.Range = charSourceRangeFromSourceRange(SM, S->getSourceRange());
-
-    if (!ForS->getInitializerVarDecls().empty()) {
-      auto InitDs = ForS->getInitializerVarDecls();
-      // Initializer decls come as a PatternBindingDecl followed by VarDecl's
-      // for each pattern set up.  The PBD covers the whole initializer.
-      assert(isa<PatternBindingDecl>(InitDs[0]));
-      SourceRange ElemRange = InitDs[0]->getSourceRange();
-      SN.Elements.emplace_back(SyntaxStructureElementKind::InitExpr,
-                               charSourceRangeFromSourceRange(SM, ElemRange));
-    } else if (ForS->getInitializer()) {
-      addExprElem(SyntaxStructureElementKind::InitExpr,
-                  ForS->getInitializer().get(), SN);
-    }
-
-    if (ForS->getCond()) {
-      addExprElem(SyntaxStructureElementKind::Expr, ForS->getCond().get(), SN);
-    }
-    if (ForS->getIncrement()) {
-      addExprElem(SyntaxStructureElementKind::Expr, ForS->getIncrement().get(),
-                  SN);
-    }
     pushStructureNode(SN, S);
 
   } else if (auto *WhileS = dyn_cast<WhileStmt>(S)) {
@@ -631,7 +581,6 @@ std::pair<bool, Stmt *> ModelASTWalker::walkToStmtPre(Stmt *S) {
                                charSourceRangeFromSourceRange(SM, ElemRange));
     }
     pushStructureNode(SN, S);
-    handleStmtCondition(WhileS->getCond());
 
   } else if (auto *RepeatWhileS = dyn_cast<RepeatWhileStmt>(S)) {
     SyntaxStructureNode SN;
@@ -654,7 +603,6 @@ std::pair<bool, Stmt *> ModelASTWalker::walkToStmtPre(Stmt *S) {
                                charSourceRangeFromSourceRange(SM, ElemRange));
     }
     pushStructureNode(SN, S);
-    handleStmtCondition(IfS->getCond());
 
   } else if (auto *GS = dyn_cast<GuardStmt>(S)) {
     SyntaxStructureNode SN;
@@ -668,7 +616,6 @@ std::pair<bool, Stmt *> ModelASTWalker::walkToStmtPre(Stmt *S) {
                                charSourceRangeFromSourceRange(SM, ElemRange));
     }
     pushStructureNode(SN, S);
-    handleStmtCondition(GS->getCond());
 
   } else if (auto *SwitchS = dyn_cast<SwitchStmt>(S)) {
     SyntaxStructureNode SN;
@@ -710,39 +657,6 @@ std::pair<bool, Stmt *> ModelASTWalker::walkToStmtPre(Stmt *S) {
       pushStructureNode(SN, SW);
     }
 
-  } else if (auto ConfigS = dyn_cast<IfConfigStmt>(S)) {
-    for (auto &Clause : ConfigS->getClauses()) {
-      unsigned TokLen;
-      if (&Clause == &*ConfigS->getClauses().begin())
-        TokLen = 3; // '#if'
-      else if (Clause.Cond == nullptr)
-        TokLen = 5; // '#else'
-      else
-        TokLen = 7; // '#elseif'
-      if (!passNonTokenNode({SyntaxNodeKind::BuildConfigKeyword,
-        CharSourceRange(Clause.Loc, TokLen) }))
-        return { false, nullptr };
-
-      if (Clause.Cond && !annotateIfConfigConditionIdentifiers(Clause.Cond))
-        return { false, nullptr };
-
-      for (auto &Element : Clause.Elements) {
-        if (Expr *E = Element.dyn_cast<Expr*>()) {
-          E->walk(*this);
-        } else if (Stmt *S = Element.dyn_cast<Stmt*>()) {
-          S->walk(*this);
-        } else {
-          Element.get<Decl*>()->walk(*this);
-        }
-        VisitedNodesInsideIfConfig.insert(Element);
-      }
-    }
-    
-    if (!ConfigS->hadMissingEnd())
-      if (!passNonTokenNode({ SyntaxNodeKind::BuildConfigKeyword,
-        CharSourceRange(ConfigS->getEndLoc(), 6/*'#endif'*/) }))
-        return { false, nullptr };
-
   } else if (auto *DeferS = dyn_cast<DeferStmt>(S)) {
     if (auto *FD = DeferS->getTempDecl()) {
       auto *RetS = FD->getBody()->walk(*this);
@@ -763,7 +677,7 @@ Stmt *ModelASTWalker::walkToStmtPost(Stmt *S) {
 }
 
 bool ModelASTWalker::walkToDeclPre(Decl *D) {
-  if (isVisitedBeforeInIfConfigStmt(D))
+  if (isVisitedBeforeInIfConfig(D))
     return false;
   if (D->isImplicit())
     return false;
@@ -772,32 +686,11 @@ bool ModelASTWalker::walkToDeclPre(Decl *D) {
     return false;
 
   if (auto *AFD = dyn_cast<AbstractFunctionDecl>(D)) {
-    FuncDecl *FD = dyn_cast<FuncDecl>(AFD);
-    if (FD && FD->isAccessor()) {
-      // Pass context sensitive keyword token.
-      SourceLoc SL = FD->getFuncLoc();
-      // Make sure the func loc is not the start of the function body, in which
-      // case the context sensitive keyword was implied.
-      if (FD->getBodySourceRange().Start != SL) {
-        unsigned TokLen;
-        switch (FD->getAccessorKind()) {
-          case AccessorKind::NotAccessor: llvm_unreachable("expected accessor");
-          case AccessorKind::IsGetter: TokLen = 3; break;
-          case AccessorKind::IsSetter: TokLen = 3; break;
-          case AccessorKind::IsAddressor: TokLen = 7; break;
-          case AccessorKind::IsMutableAddressor: TokLen = 14; break;
-          case AccessorKind::IsWillSet: TokLen = 7; break;
-          case AccessorKind::IsDidSet: TokLen = 6; break;
-          case AccessorKind::IsMaterializeForSet: llvm_unreachable("always implicit");
-        }
-        if (!passNonTokenNode({ SyntaxNodeKind::Keyword,
-                                CharSourceRange(SL, TokLen)}))
-          return false;
-      }
-    } else {
+    auto *FD = dyn_cast<FuncDecl>(AFD);
+    if (!FD || !FD->isAccessor()) {
       // Pass Function / Method structure node.
       SyntaxStructureNode SN;
-      SN.Dcl = D;
+      setDecl(SN, D);
       const DeclContext *DC = AFD->getDeclContext();
       if (DC->isTypeContext()) {
         if (FD && FD->isStatic()) {
@@ -816,12 +709,15 @@ bool ModelASTWalker::walkToDeclPre(Decl *D) {
                                                      AFD->getBodySourceRange());
       SN.NameRange = charSourceRangeFromSourceRange(SM,
                           AFD->getSignatureSourceRange());
-      SN.Attrs = AFD->getAttrs();
+      if (FD) {
+        SN.TypeRange = charSourceRangeFromSourceRange(SM,
+                                      FD->getReturnTypeLoc().getSourceRange());
+      }
       pushStructureNode(SN, AFD);
     }
   } else if (auto *NTD = dyn_cast<NominalTypeDecl>(D)) {
     SyntaxStructureNode SN;
-    SN.Dcl = D;
+    setDecl(SN, D);
     SN.Kind = syntaxStructureKindFromNominalTypeDecl(NTD);
     SN.Range = charSourceRangeFromSourceRange(SM, NTD->getSourceRange());
     SN.BodyRange = innerCharSourceRangeFromSourceRange(SM, NTD->getBraces());
@@ -836,12 +732,11 @@ bool ModelASTWalker::walkToDeclPre(Decl *D) {
       SN.Elements.emplace_back(SyntaxStructureElementKind::TypeRef, TR);
     }
 
-    SN.Attrs = NTD->getAttrs();
     pushStructureNode(SN, NTD);
 
   } else if (auto *ED = dyn_cast<ExtensionDecl>(D)) {
     SyntaxStructureNode SN;
-    SN.Dcl = D;
+    setDecl(SN, D);
     SN.Kind = SyntaxStructureKind::Extension;
     SN.Range = charSourceRangeFromSourceRange(SM, ED->getSourceRange());
     SN.BodyRange = innerCharSourceRangeFromSourceRange(SM, ED->getBraces());
@@ -855,7 +750,6 @@ bool ModelASTWalker::walkToDeclPre(Decl *D) {
       SN.Elements.emplace_back(SyntaxStructureElementKind::TypeRef, TR);
     }
 
-    SN.Attrs = ED->getAttrs();
     pushStructureNode(SN, ED);
 
   } else if (auto *PD = dyn_cast<ParamDecl>(D)) {
@@ -874,42 +768,41 @@ bool ModelASTWalker::walkToDeclPre(Decl *D) {
     pushStructureNode(SN, PD);
   } else if (auto *VD = dyn_cast<VarDecl>(D)) {
     const DeclContext *DC = VD->getDeclContext();
-    if (DC->isTypeContext() || DC->isModuleScopeContext()) {
-      SyntaxStructureNode SN;
-      SN.Dcl = D;
-      SourceRange SR;
-      if (auto *PBD = VD->getParentPatternBinding())
-        SR = PBD->getSourceRange();
-      else
-        SR = VD->getSourceRange();
-      SN.Range = charSourceRangeFromSourceRange(SM, SR);
-      if (VD->hasAccessorFunctions())
-        SN.BodyRange = innerCharSourceRangeFromSourceRange(SM,
-                                                           VD->getBracesRange());
-      SourceLoc NRStart = VD->getNameLoc();
-      SourceLoc NREnd = NRStart.getAdvancedLoc(VD->getName().getLength());
-      SN.NameRange = CharSourceRange(SM, NRStart, NREnd);
-      SN.TypeRange = charSourceRangeFromSourceRange(SM,
+    SyntaxStructureNode SN;
+    setDecl(SN, D);
+    SourceRange SR;
+    if (auto *PBD = VD->getParentPatternBinding())
+      SR = PBD->getSourceRange();
+    else
+      SR = VD->getSourceRange();
+    SN.Range = charSourceRangeFromSourceRange(SM, SR);
+    if (VD->hasAccessorFunctions())
+      SN.BodyRange = innerCharSourceRangeFromSourceRange(SM,
+                                                         VD->getBracesRange());
+    SourceLoc NRStart = VD->getNameLoc();
+    SourceLoc NREnd = NRStart.getAdvancedLoc(VD->getName().getLength());
+    SN.NameRange = CharSourceRange(SM, NRStart, NREnd);
+    SN.TypeRange = charSourceRangeFromSourceRange(SM,
                                         VD->getTypeSourceRangeForDiagnostics());
 
-      if (DC->isTypeContext()) {
-        if (VD->isStatic()) {
-          StaticSpellingKind Spell = StaticSpellingKind::KeywordStatic;
-          if (auto *PBD = VD->getParentPatternBinding())
-            Spell = PBD->getStaticSpelling();
-          if (Spell == StaticSpellingKind::KeywordClass)
-            SN.Kind = SyntaxStructureKind::ClassVariable;
-          else
-            SN.Kind = SyntaxStructureKind::StaticVariable;
-        } else {
-          SN.Kind = SyntaxStructureKind::InstanceVariable;
-        }
+    if (DC->isLocalContext()) {
+      SN.Kind = SyntaxStructureKind::LocalVariable;
+    } else if (DC->isTypeContext()) {
+      if (VD->isStatic()) {
+        StaticSpellingKind Spell = StaticSpellingKind::KeywordStatic;
+        if (auto *PBD = VD->getParentPatternBinding())
+          Spell = PBD->getStaticSpelling();
+        if (Spell == StaticSpellingKind::KeywordClass)
+          SN.Kind = SyntaxStructureKind::ClassVariable;
+        else
+          SN.Kind = SyntaxStructureKind::StaticVariable;
       } else {
-        SN.Kind = SyntaxStructureKind::GlobalVariable;
+        SN.Kind = SyntaxStructureKind::InstanceVariable;
       }
-      SN.Attrs = VD->getAttrs();
-      pushStructureNode(SN, VD);
+    } else {
+      SN.Kind = SyntaxStructureKind::GlobalVariable;
     }
+    pushStructureNode(SN, VD);
 
   } else if (auto *ConfigD = dyn_cast<IfConfigDecl>(D)) {
     for (auto &Clause : ConfigD->getClauses()) {
@@ -927,9 +820,16 @@ bool ModelASTWalker::walkToDeclPre(Decl *D) {
       if (Clause.Cond && !annotateIfConfigConditionIdentifiers(Clause.Cond))
         return false;
 
-      for (auto *D : Clause.Members)
-        if (D->walk(*this))
-          return false;
+      for (auto &Element : Clause.Elements) {
+        if (auto *E = Element.dyn_cast<Expr*>()) {
+          E->walk(*this);
+        } else if (auto *S = Element.dyn_cast<Stmt*>()) {
+          S->walk(*this);
+        } else {
+          Element.get<Decl*>()->walk(*this);
+        }
+        VisitedNodesInsideIfConfig.insert(Element);
+      }
     }
     
     if (!ConfigD->hadMissingEnd())
@@ -937,22 +837,9 @@ bool ModelASTWalker::walkToDeclPre(Decl *D) {
             CharSourceRange(ConfigD->getEndLoc(), 6/*'#endif'*/) }))
         return false;
 
-  } else if (auto PrecD = dyn_cast<PrecedenceGroupDecl>(D)) {
-    // Highlight specifiers like "associativity" or "assignment" as keywords.
-    SmallVector<CharSourceRange, 3> KeywordsRanges;
-    PrecD->collectOperatorKeywordRanges(KeywordsRanges);
-    for (auto &Range : KeywordsRanges) {
-      passNonTokenNode({SyntaxNodeKind::Keyword, Range});
-    };
-
-  } else if (auto OperD = dyn_cast<OperatorDecl>(D)) {
-    if (!passNonTokenNode({ SyntaxNodeKind::Keyword,
-          CharSourceRange(OperD->getOperatorLoc(), strlen("operator")) }))
-      return false;
-
   } else if (auto *EnumCaseD = dyn_cast<EnumCaseDecl>(D)) {
     SyntaxStructureNode SN;
-    SN.Dcl = D;
+    setDecl(SN, D);
     SN.Kind = SyntaxStructureKind::EnumCase;
     SN.Range = charSourceRangeFromSourceRange(SM, D->getSourceRange());
 
@@ -976,7 +863,7 @@ bool ModelASTWalker::walkToDeclPre(Decl *D) {
         if (EnumElemD->getName().empty())
           continue;
         SyntaxStructureNode SN;
-        SN.Dcl = EnumElemD;
+        setDecl(SN, EnumElemD);
         SN.Kind = SyntaxStructureKind::EnumElement;
         SN.Range = charSourceRangeFromSourceRange(SM,
                                                   EnumElemD->getSourceRange());
@@ -991,6 +878,37 @@ bool ModelASTWalker::walkToDeclPre(Decl *D) {
         popStructureNode();
       }
     }
+  } else if (auto *TypeAliasD = dyn_cast<TypeAliasDecl>(D)) {
+    SyntaxStructureNode SN;
+    setDecl(SN, D);
+    SN.Kind = SyntaxStructureKind::TypeAlias;
+    SN.Range = charSourceRangeFromSourceRange(SM,
+                                              TypeAliasD->getSourceRange());
+    SN.NameRange = CharSourceRange(TypeAliasD->getNameLoc(),
+                                   TypeAliasD->getName().getLength());
+    pushStructureNode(SN, TypeAliasD);
+  } else if (auto *SubscriptD = dyn_cast<SubscriptDecl>(D)) {
+    SyntaxStructureNode SN;
+    setDecl(SN, D);
+    SN.Kind = SyntaxStructureKind::Subscript;
+    SN.Range = charSourceRangeFromSourceRange(SM,
+                                              SubscriptD->getSourceRange());
+    SN.BodyRange = innerCharSourceRangeFromSourceRange(SM,
+                                               SubscriptD->getBracesRange());
+    SN.NameRange = charSourceRangeFromSourceRange(SM,
+                                        SubscriptD->getSignatureSourceRange());
+    SN.TypeRange = charSourceRangeFromSourceRange(SM,
+                            SubscriptD->getElementTypeLoc().getSourceRange());
+    pushStructureNode(SN, SubscriptD);
+  } else if (auto *AssociatedTypeD = dyn_cast<AssociatedTypeDecl>(D)) {
+    SyntaxStructureNode SN;
+    setDecl(SN, D);
+    SN.Kind = SyntaxStructureKind::AssociatedType;
+    SN.Range = charSourceRangeFromSourceRange(SM,
+                                            AssociatedTypeD->getSourceRange());
+    SN.NameRange = CharSourceRange(AssociatedTypeD->getNameLoc(),
+                                   AssociatedTypeD->getName().getLength());
+    pushStructureNode(SN, AssociatedTypeD);
   }
 
   return true;
@@ -1019,22 +937,6 @@ bool ModelASTWalker::walkToTypeReprPre(TypeRepr *T) {
   return true;
 }
 
-std::pair<bool, Pattern*> ModelASTWalker::walkToPatternPre(Pattern *P) {
-  if (!P->isImplicit()) {
-    if (auto TyPat = dyn_cast<TypedPattern>(P)) {
-      if (auto InOutT =
-           dyn_cast_or_null<InOutTypeRepr>(TyPat->getTypeLoc().getTypeRepr())) {
-        if (!passNonTokenNode({ SyntaxNodeKind::Keyword,
-                                CharSourceRange(InOutT->getInOutLoc(),
-                                                /*'inout'*/5)
-                              }))
-          return { false, nullptr };
-      }
-    }
-  }
-  return { true, P };
-}
-
 namespace {
 template <typename FnTy>
 class IdRefWalker : public ASTWalker {
@@ -1049,14 +951,15 @@ public:
         return { true, E };
       if (DRE->getRefKind() != DeclRefKind::Ordinary)
         return { true, E };
-      if (!Fn(CharSourceRange(DRE->getSourceRange().Start,
-                              DRE->getName().getBaseName().getLength())))
+      if (!Fn(CharSourceRange(
+              DRE->getSourceRange().Start,
+              DRE->getName().getBaseName().userFacingName().size())))
         return { false, nullptr };
     }
     return { true, E };
   }
 };
-}
+} // end anonymous namespace
 
 bool ModelASTWalker::annotateIfConfigConditionIdentifiers(Expr *Cond) {
   if (!Cond)
@@ -1066,28 +969,14 @@ bool ModelASTWalker::annotateIfConfigConditionIdentifiers(Expr *Cond) {
   };
 
   IdRefWalker<decltype(passNode)> Walker(passNode);
-  if (!Cond->walk(Walker))
-    return false;
-  return true;
+  return Cond->walk(Walker);
 }
 
 bool ModelASTWalker::handleSpecialDeclAttribute(const DeclAttribute *D,
-                                                std::vector<Token> &Toks) {
+                                                ArrayRef<Token> Toks) {
   if (!D)
     return false;
   if (isa<AvailableAttr>(D)) {
-    std::vector<SourceLoc> PlatformLocs;
-    for (auto T : Toks) {
-      if (!SM.rangeContainsTokenLoc(D->getRangeWithAt(), T.getLoc()))
-        continue;
-#define AVAILABILITY_PLATFORM(X, PrettyName)                                  \
-      if (#X == T.getText()) {                                                \
-        PlatformLocs.push_back(T.getLoc());                                   \
-        continue;                                                             \
-      }
-#include "swift/AST/PlatformKinds.def"
-    }
-
     unsigned I = 0;
     for (; I < TokenNodes.size(); ++ I) {
       auto Node = TokenNodes[I];
@@ -1098,13 +987,7 @@ bool ModelASTWalker::handleSpecialDeclAttribute(const DeclAttribute *D,
           break;
         continue;
       }
-      if (PlatformLocs.end() !=
-          std::find(PlatformLocs.begin(), PlatformLocs.end(),
-                    Node.Range.getStart())) {
-          if (!passNode({SyntaxNodeKind::Keyword, Node.Range}))
-            break;
-          continue;
-      }
+
       if (!passNode(Node))
         break;
     }
@@ -1147,12 +1030,8 @@ bool ModelASTWalker::handleAttrRanges(ArrayRef<DeclAttributeAndRange> DeclRanges
 
   SourceLoc BeginLoc = DeclRanges.front().second.Start;
 
-  std::vector<Token> Toks = swift::tokenize(
-      LangOpts, SM, BufferID,
-      SM.getLocOffsetInBuffer(BeginLoc, BufferID),
-      SM.getLocOffsetInBuffer(DeclRanges.back().second.End, BufferID),
-      /*KeepComments=*/true,
-      /*TokenizeInterpolatedString=*/false);
+  auto Toks = slice_token_array(AllTokensInFile, BeginLoc,
+                                DeclRanges.back().second.End);
 
   auto passAttrNode = [&](SourceRange AttrRange) -> bool {
     SourceRange Range = AttrRange;
@@ -1259,9 +1138,7 @@ bool ModelASTWalker::passNode(const SyntaxNode &Node) {
     }
   }
 
-  if (!Walker.walkToNodePost(Node))
-    return false;
-  return true;
+  return Walker.walkToNodePost(Node);
 }
 
 bool ModelASTWalker::pushStructureNode(const SyntaxStructureNode &Node,
@@ -1283,7 +1160,7 @@ bool ModelASTWalker::popStructureNode() {
 
   // VarDecls are popped before we see their TypeRepr, so if we pass the token
   // nodes now they will not change from identifier to a type-identifier.
-  if (!Node.isVariable()) {
+  if (!Node.hasSubstructure()) {
     if (!passTokenNodesUntil(Node.Range.getEnd(), IncludeNodeAtLocation))
       return false;
   }
@@ -1351,24 +1228,32 @@ bool ModelASTWalker::findUrlStartingLoc(StringRef Text,
   static const auto MailToPosition = std::find(URLProtocols.begin(),
                                                URLProtocols.end(),
                                                "mailto");
-  static const auto RadarPosition = std::find(URLProtocols.begin(),
-                                              URLProtocols.end(),
-                                              "radar");
   auto Index = Text.find(":");
   if (Index == StringRef::npos)
     return false;
 
-  for (auto It = URLProtocols.begin(); It != URLProtocols.end(); ++ It) {
-    if (Index >= It->size() &&
-        Text.substr(Index - It->size(), It->size()) == *It) {
-      Start = Index - It->size();
-      if (It < MailToPosition)
-        Regex = getURLRegex(0);
-      else if (It < RadarPosition)
-        Regex = getURLRegex(1);
-      else
-        Regex = getURLRegex(2);
-      return true;
+  auto Lookback = [Text](unsigned Index, StringRef Name) {
+    return Index >= Name.size() &&
+      Text.substr(Index - Name.size(), Name.size()) == Name;
+  };
+
+  auto HasSlash = Text.substr(Index).startswith("://");
+
+  if (HasSlash) {
+    for (auto It = URLProtocols.begin(); It < URLProtocols.end(); ++ It) {
+      if (Lookback(Index, *It)) {
+        Regex = getURLRegex(*It);
+        Start = Index - It->size();
+        return true;
+      }
+    }
+  } else {
+    for (auto It = MailToPosition; It < URLProtocols.end(); ++ It) {
+      if (Lookback(Index, *It)) {
+        Regex = getURLRegex(*It);
+        Start = Index - It->size();
+        return true;
+      }
     }
   }
 #endif
@@ -1429,27 +1314,86 @@ bool ModelASTWalker::searchForURL(CharSourceRange Range) {
   return true;
 }
 
+namespace {
+class DocFieldParser {
+  const char *ptr;
+  const char *end;
+
+  bool advanceIf(char c) {
+    if (ptr == end || c != *ptr)
+      return false;
+    ++ptr;
+    return true;
+  }
+  bool advanceIf(llvm::function_ref<bool(char)> predicate) {
+    if (ptr == end || !predicate(*ptr))
+      return false;
+    ++ptr;
+    return true;
+  }
+
+public:
+  DocFieldParser(StringRef text) : ptr(text.begin()), end(text.end()) {
+    assert(text.rtrim().find('\n') == StringRef::npos &&
+           "expected single line");
+  }
+
+  // Case-insensitively match one of the following patterns:
+  // ^[ ]?- (parameter) [^:]*:
+  // ^[ ]?- (Parameters):
+  // ^[ ]*- (...MarkupSimpleFields.def...|returns):
+  Optional<StringRef> parseFieldName() {
+    unsigned numSpaces = 0;
+    while (advanceIf(' '))
+      ++numSpaces;
+    if (!advanceIf('-') || !advanceIf(' '))
+      return None;
+
+    if (ptr == end || !clang::isIdentifierBody(*ptr))
+      return None;
+    const char *identStart = ptr++;
+    while (advanceIf([](char c) { return clang::isIdentifierBody(c); }))
+      ;
+    StringRef ident(identStart, ptr - identStart);
+
+    if (ident.equals_lower("parameter")) {
+      if (numSpaces > 1 || !advanceIf(' '))
+        return None;
+      while (advanceIf([](char c) { return c != ':'; }))
+        ;
+      if (!advanceIf(':'))
+        return None;
+      return ident;
+
+    } else if (advanceIf(':')) {
+      if (ident.equals_lower("parameters") && numSpaces > 1)
+        return None;
+      auto lowerIdent = ident.lower();
+      bool isField = llvm::StringSwitch<bool>(lowerIdent)
+#define MARKUP_SIMPLE_FIELD(Id, Keyword, XMLKind) .Case(#Keyword, true)
+#include "swift/Markup/SimpleFields.def"
+                         .Case("parameters", true)
+                         .Case("returns", true)
+                         .Default(false);
+      if (isField)
+        return ident;
+    }
+
+    return None;
+  }
+};
+} // end anonymous namespace
+
 Optional<SyntaxNode> ModelASTWalker::parseFieldNode(StringRef Text,
                                                     StringRef OrigText,
                                                     SourceLoc OrigLoc) {
   Optional<SyntaxNode> Node;
-#ifdef SWIFT_HAVE_WORKING_STD_REGEX
-  std::match_results<StringRef::iterator> Matches;
-  for (unsigned i = 0; i != 3; ++i) {
-    auto &Rx = getDocCommentRegex(i);
-    bool HadMatch = std::regex_search(Text.begin(), Text.end(), Matches, Rx);
-    if (HadMatch)
-      break;
+  DocFieldParser parser(Text);
+  if (auto ident = parser.parseFieldName()) {
+    auto loc = OrigLoc.getAdvancedLoc(ident->data() - OrigText.data());
+    CharSourceRange range(loc, ident->size());
+    Node = Optional<SyntaxNode>({SyntaxNodeKind::DocCommentField, range});
   }
-  if (Matches.empty())
-    return None;
-
-  auto &Match = Matches[1];
-  StringRef MatchStr(Match.first, Match.second - Match.first);
-  auto Loc = OrigLoc.getAdvancedLoc(MatchStr.data() - OrigText.data());
-  CharSourceRange Range(Loc, MatchStr.size());
-  Node = Optional<SyntaxNode>({ SyntaxNodeKind::DocCommentField, Range });
-#endif
   return Node;
 }
 

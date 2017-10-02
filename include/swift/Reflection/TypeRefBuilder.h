@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -62,7 +62,7 @@ public:
   }
 
   size_t size() const {
-    return (char *)End - (char *)Begin;
+    return (const char *)End - (const char *)Begin;
   }
 };
 
@@ -134,6 +134,8 @@ public:
   TypeRefBuilder &operator=(const TypeRefBuilder &other) = delete;
 
 private:
+  Demangle::Demangler Dem;
+
   /// Makes sure dynamically allocated TypeRefs stick around for the life of
   /// this TypeRefBuilder and are automatically released.
   std::vector<std::unique_ptr<const TypeRef>> TypeRefPool;
@@ -176,9 +178,20 @@ public:
   }
 
   const NominalTypeRef *createNominalType(
+                                    const Optional<std::string> &mangledName) {
+    return NominalTypeRef::create(*this, *mangledName, nullptr);
+  }
+
+  const NominalTypeRef *createNominalType(
                                     const Optional<std::string> &mangledName,
                                     const TypeRef *parent) {
     return NominalTypeRef::create(*this, *mangledName, parent);
+  }
+
+  const BoundGenericTypeRef *
+  createBoundGenericType(const Optional<std::string> &mangledName,
+                         const std::vector<const TypeRef *> &args) {
+    return BoundGenericTypeRef::create(*this, *mangledName, args, nullptr);
   }
 
   const BoundGenericTypeRef *
@@ -208,17 +221,22 @@ public:
 
   const ProtocolTypeRef *createProtocolType(const std::string &mangledName,
                                             const std::string &moduleName,
+                                            const std::string &privateDiscriminator,
                                             const std::string &name) {
     return ProtocolTypeRef::create(*this, mangledName);
   }
 
   const ProtocolCompositionTypeRef *
-  createProtocolCompositionType(const std::vector<const TypeRef*> &protocols) {
-    for (auto protocol : protocols) {
-      if (!isa<ProtocolTypeRef>(protocol))
+  createProtocolCompositionType(const std::vector<const TypeRef*> &members,
+                                bool hasExplicitAnyObject) {
+    for (auto member : members) {
+      if (!isa<ProtocolTypeRef>(member) &&
+          !isa<NominalTypeRef>(member) &&
+          !isa<BoundGenericTypeRef>(member))
         return nullptr;
     }
-    return ProtocolCompositionTypeRef::create(*this, protocols);
+    return ProtocolCompositionTypeRef::create(*this, members,
+                                              hasExplicitAnyObject);
   }
 
   const ExistentialMetatypeTypeRef *
@@ -305,17 +323,14 @@ public:
                     const TypeRef *Protocol);
 
   const TypeRef *
-  lookupSuperclass(const std::string &MangledTypeName);
-
-  const TypeRef *
   lookupSuperclass(const TypeRef *TR);
 
   /// Load unsubstituted field types for a nominal type.
   const FieldDescriptor *getFieldTypeInfo(const TypeRef *TR);
 
   /// Get the parsed and substituted field types for a nominal type.
-  std::vector<FieldTypeInfo>
-  getFieldTypeRefs(const TypeRef *TR, const FieldDescriptor *FD);
+  bool getFieldTypeRefs(const TypeRef *TR, const FieldDescriptor *FD,
+                        std::vector<FieldTypeInfo> &Fields);
 
   /// Get the primitive type lowering for a builtin type.
   const BuiltinTypeDescriptor *getBuiltinTypeInfo(const TypeRef *TR);

@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -23,9 +23,11 @@
 #include "swift/AST/LookupKinds.h"
 #include "swift/AST/RawComment.h"
 #include "swift/AST/Type.h"
+#include "swift/Basic/Compiler.h"
 #include "swift/Basic/OptionSet.h"
 #include "swift/Basic/SourceLoc.h"
 #include "swift/Basic/STLExtras.h"
+#include "swift/Parse/Token.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SetVector.h"
@@ -208,9 +210,6 @@ private:
     unsigned ResilienceStrategy : 2;
   } Flags;
 
-  /// The magic __dso_handle variable.
-  VarDecl *DSOHandle;
-
   ModuleDecl(Identifier name, ASTContext &ctx);
 
 public:
@@ -324,13 +323,11 @@ public:
   ///
   /// \param protocol The protocol to which we are computing conformance.
   ///
-  /// \param resolver The lazy resolver.
-  ///
   /// \returns The result of the conformance search, which will be
   /// None if the type does not conform to the protocol or contain a
   /// ProtocolConformanceRef if it does conform.
   Optional<ProtocolConformanceRef>
-  lookupConformance(Type type, ProtocolDecl *protocol, LazyResolver *resolver);
+  lookupConformance(Type type, ProtocolDecl *protocol);
 
   /// Find a member named \p name in \p container that was declared in this
   /// module.
@@ -491,7 +488,7 @@ public:
   }
 
   /// Returns the associated clang module if one exists.
-  const clang::Module *findUnderlyingClangModule();
+  const clang::Module *findUnderlyingClangModule() const;
 
   SourceRange getSourceRange() const { return SourceRange(); }
 
@@ -506,7 +503,7 @@ public:
 private:
   // Make placement new and vanilla new/delete illegal for Modules.
   void *operator new(size_t Bytes) throw() = delete;
-  void operator delete(void *Data) throw() = delete;
+  void operator delete(void *Data) throw() SWIFT_DELETE_OPERATOR_DELETED;
   void *operator new(size_t Bytes, void *Mem) throw() = delete;
 public:
   // Only allow allocation of Modules using the allocator in ASTContext
@@ -515,8 +512,7 @@ public:
                      unsigned Alignment = alignof(ModuleDecl));
 };
 
-/// FIXME: Helper for the Module -> ModuleDecl migration.
-typedef ModuleDecl Module;
+static inline unsigned alignOfFileUnit();
 
 /// A container for module-scope declarations that itself provides a scope; the
 /// smallest unit of code organization.
@@ -555,6 +551,18 @@ public:
   ///
   /// This does a simple local lookup, not recursively looking through imports.
   virtual TypeDecl *lookupLocalType(StringRef MangledName) const {
+    return nullptr;
+  }
+
+  /// Directly look for a nested type declared within this module inside the
+  /// given nominal type (including any extensions).
+  ///
+  /// This is a fast-path hack to avoid circular dependencies in deserialization
+  /// and the Clang importer.
+  ///
+  /// Private and fileprivate types should not be returned by this lookup.
+  virtual TypeDecl *lookupNestedType(Identifier name,
+                                     const NominalTypeDecl *parent) const {
     return nullptr;
   }
 
@@ -656,7 +664,7 @@ public:
   getImportedModules(SmallVectorImpl<ModuleDecl::ImportedModule> &imports,
                      ModuleDecl::ImportFilter filter) const {}
 
-  /// \see Module::getImportedModulesForLookup
+  /// \see ModuleDecl::getImportedModulesForLookup
   virtual void getImportedModulesForLookup(
       SmallVectorImpl<ModuleDecl::ImportedModule> &imports) const {
     return getImportedModules(imports, ModuleDecl::ImportFilter::Public);
@@ -681,7 +689,7 @@ public:
 
   bool
   forAllVisibleModules(llvm::function_ref<void(ModuleDecl::ImportedModule)> fn) {
-    return forAllVisibleModules([=](Module::ImportedModule import) -> bool {
+    return forAllVisibleModules([=](ModuleDecl::ImportedModule import) -> bool {
       fn(import);
       return true;
     });
@@ -711,7 +719,9 @@ public:
   }
 
   /// Returns the associated clang module if one exists.
-  virtual const clang::Module *getUnderlyingClangModule() { return nullptr; }
+  virtual const clang::Module *getUnderlyingClangModule() const {
+    return nullptr;
+  }
 
   /// Traverse the decls within this file.
   ///
@@ -744,8 +754,12 @@ public:
   // Only allow allocation of FileUnits using the allocator in ASTContext
   // or by doing a placement new.
   void *operator new(size_t Bytes, ASTContext &C,
-                     unsigned Alignment = alignof(FileUnit));
+                     unsigned Alignment = alignOfFileUnit());
 };
+
+static inline unsigned alignOfFileUnit() {
+  return alignof(FileUnit&);
+}
   
 /// A file containing Swift source code.
 ///
@@ -831,13 +845,13 @@ public:
   std::vector<Decl*> Decls;
 
   /// The list of local type declarations in the source file.
-  TinyPtrVector<TypeDecl*> LocalTypeDecls;
+  llvm::SetVector<TypeDecl *> LocalTypeDecls;
 
   /// A set of special declaration attributes which require the
   /// Foundation module to be imported to work. If the foundation
   /// module is still not imported by the time type checking is
   /// complete, we diagnose.
-  std::map<DeclAttrKind, const DeclAttribute *> AttrsRequiringFoundation;
+  llvm::SetVector<const DeclAttribute *> AttrsRequiringFoundation;
 
   /// A mapping from Objective-C selectors to the methods that have
   /// those selectors.
@@ -875,7 +889,7 @@ public:
   ASTStage_t ASTStage = Parsing;
 
   SourceFile(ModuleDecl &M, SourceFileKind K, Optional<unsigned> bufferID,
-             ImplicitModuleImportKind ModImpKind);
+             ImplicitModuleImportKind ModImpKind, bool KeepTokens);
 
   void
   addImports(ArrayRef<std::pair<ModuleDecl::ImportedModule, ImportOptions>> IM);
@@ -1059,6 +1073,24 @@ public:
     getInterfaceHash(str);
     out << str << '\n';
   }
+
+  std::vector<Token> &getTokenVector() {
+    assert(shouldKeepTokens() && "Disabled");
+    return *AllCorrectedTokens;
+  }
+
+  ArrayRef<Token> getAllTokens() const {
+    assert(shouldKeepTokens() && "Disabled");
+    return *AllCorrectedTokens;
+  }
+
+  bool shouldKeepTokens() const {
+    return (bool)AllCorrectedTokens;
+  }
+
+private:
+  /// If not None, the underlying vector should contain tokens of this source file.
+  Optional<std::vector<Token>> AllCorrectedTokens;
 };
 
 

@@ -208,8 +208,8 @@
 //
 // Literals
 //
-// KW_EXPR-DAG: Literal[Boolean]/None: false[#Bool#]{{; name=.+$}}
-// KW_EXPR-DAG: Literal[Boolean]/None: true[#Bool#]{{; name=.+$}}
+// KW_EXPR-DAG: Literal[Boolean]/None{{(/TypeRelation\[Identical\])?}}: false[#Bool#]{{; name=.+$}}
+// KW_EXPR-DAG: Literal[Boolean]/None{{(/TypeRelation\[Identical\])?}}: true[#Bool#]{{; name=.+$}}
 // KW_EXPR-DAG: Literal[Nil]/None: nil{{; name=.+$}}
 // KW_EXPR: End completions
 
@@ -217,18 +217,18 @@
 //
 // Declaration keywords
 //
-// KW_EXPR_NEG-NOT: class
-// KW_EXPR_NEG-NOT: convenience
-// KW_EXPR_NEG-NOT: mutating
-// KW_EXPR_NEG-NOT: weak
+// KW_EXPR_NEG-NOT: Keyword{{.*}}class
+// KW_EXPR_NEG-NOT: Keyword{{.*}}convenience
+// KW_EXPR_NEG-NOT: Keyword{{.*}}mutating
+// KW_EXPR_NEG-NOT: Keyword{{.*}}weak
 //
 // Statement keywords
 //
 // KW_EXPR_NEG-NOT: Keyword{{.*}}throw
-// KW_EXPR_NEG-NOT: while
-// KW_EXPR_NEG-NOT: switch
-// KW_EXPR_NEG-NOT: catch
-// KW_EXPR_NEG-NOT: break
+// KW_EXPR_NEG-NOT: Keyword{{.*}}while
+// KW_EXPR_NEG-NOT: Keyword{{.*}}switch
+// KW_EXPR_NEG-NOT: Keyword{{.*}}catch
+// KW_EXPR_NEG-NOT: Keyword{{.*}}break
 // KW_EXPR_NEG: End completions
 
 #^TOP_LEVEL_1^#
